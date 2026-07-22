@@ -190,6 +190,16 @@ def numeric_sort_value(value: Any) -> float:
     return 0.0
 
 
+def fmt_cost(value: Any) -> str:
+    """Money always keeps two decimals, unlike fmt_number()."""
+    if value is None:
+        return "—"
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def fmt_percent(value: float | None) -> str:
     if value is None:
         return "—"
@@ -1749,6 +1759,114 @@ def opencode_usage_table_rows(
     return rows
 
 
+def combined_tool_totals(
+    codex_data: dict[str, Any], opencode_data: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Per-tool headline figures for the combined table.
+
+    The two tools are measured differently, so these rows sit side by side
+    rather than being reconciled. See print_combined_totals().
+    """
+    rows: list[dict[str, Any]] = []
+    for label, data, cost in (
+        ("Codex", codex_data, None),
+        ("opencode", opencode_data, "reported"),
+    ):
+        sessions = data.get("sessions") if isinstance(data, dict) else None
+        if not isinstance(sessions, dict):
+            rows.append(
+                {
+                    "tool": label,
+                    "unavailable": (data or {}).get("error") or "no local data found",
+                }
+            )
+            continue
+        totals = sessions.get("final_token_totals_sum", {})
+        rows.append(
+            {
+                "tool": label,
+                "sessions": int(sessions.get("session_files") or 0),
+                "total_tokens": int(totals.get("total_tokens") or 0),
+                "output_tokens": int(totals.get("output_tokens") or 0),
+                "cost": float(sessions.get("cost_total") or 0.0)
+                if cost == "reported"
+                else None,
+                "first_seen": sessions.get("file_mtime_start_local"),
+                "last_seen": sessions.get("file_mtime_end_local"),
+            }
+        )
+    return rows
+
+
+def print_combined_totals(
+    codex_data: dict[str, Any], opencode_data: dict[str, Any]
+) -> None:
+    rows = combined_tool_totals(codex_data, opencode_data)
+    available = [row for row in rows if "unavailable" not in row]
+
+    def short_stamp(value: Any) -> str:
+        if not value:
+            return "—"
+        return str(value).split(" ")[0]
+
+    table_rows: list[list[str]] = []
+    unavailable_notes: list[str] = []
+    for row in rows:
+        if "unavailable" in row:
+            # The reason goes under the table: putting a sentence in the last
+            # column stretches every other column to match it.
+            table_rows.append([str(row["tool"]), "—", "—", "—", "—", "—", "—"])
+            unavailable_notes.append(f"{row['tool']}: {row['unavailable']}")
+            continue
+        table_rows.append(
+            [
+                str(row["tool"]),
+                fmt_int(row["sessions"]),
+                fmt_int(row["total_tokens"]),
+                fmt_int(row["output_tokens"]),
+                fmt_cost(row["cost"]),
+                short_stamp(row["first_seen"]),
+                short_stamp(row["last_seen"]),
+            ]
+        )
+    if len(available) > 1:
+        table_rows.append(
+            [
+                "Combined",
+                fmt_int(sum(int(row["sessions"]) for row in available)),
+                fmt_int(sum(int(row["total_tokens"]) for row in available)),
+                fmt_int(sum(int(row["output_tokens"]) for row in available)),
+                fmt_cost(sum(float(row["cost"] or 0.0) for row in available)),
+                short_stamp(
+                    min(
+                        (row["first_seen"] for row in available if row["first_seen"]),
+                        default=None,
+                    )
+                ),
+                short_stamp(
+                    max(
+                        (row["last_seen"] for row in available if row["last_seen"]),
+                        default=None,
+                    )
+                ),
+            ]
+        )
+
+    section("Combined Local Totals")
+    explain(
+        "These totals are not directly comparable. Codex figures come from the final token counter in each session file; opencode figures are summed per assistant message. The two tools may also bill against different accounts. Read this as where your time went, not as what you owe."
+    )
+    print_counter_table(
+        "Local usage by tool",
+        ["Tool", "Sessions", "Total tokens", "Output", "Cost", "First", "Last"],
+        table_rows,
+    )
+    for note in unavailable_notes:
+        print(f"• {note}")
+    if unavailable_notes:
+        print()
+
+
 def print_opencode_usage(data: dict[str, Any], top: int, days: int) -> None:
     section("opencode Local Usage Summary")
     explain(
@@ -1802,9 +1920,7 @@ def print_opencode_usage(data: dict[str, Any], top: int, days: int) -> None:
     token_rows.append(
         ["Cache Write Tokens", fmt_int(sessions.get("cache_write_tokens"))]
     )
-    token_rows.append(
-        ["Cost (reported)", f"${fmt_number(sessions.get('cost_total'), decimals=2)}"]
-    )
+    token_rows.append(["Cost (reported)", fmt_cost(sessions.get("cost_total"))])
     explain(
         "Totals are summed per assistant message. Total Tokens is input plus output only: opencode's own total field folds in cache reads, so adding it up would multiply cache-heavy sessions into a meaningless number. Reported cost is zero for subscription-billed providers, so this is not a bill."
     )
@@ -2014,12 +2130,15 @@ def cmd_local_usage(args: argparse.Namespace) -> None:
                 "retrieved_at_local": local_now_text(),
                 "codex_local_usage": codex_data,
                 "opencode_local_usage": opencode_data,
+                "combined_totals": combined_tool_totals(codex_data, opencode_data),
             }
         )
         return
     print_local_usage(codex_data, top=args.top, days=args.days)
     print("\n" + "=" * min(terminal_width(), 100) + "\n")
     print_opencode_usage(opencode_data, top=args.top, days=args.days)
+    print("\n" + "=" * min(terminal_width(), 100) + "\n")
+    print_combined_totals(codex_data, opencode_data)
 
 
 def path_status(path: Path) -> dict[str, Any]:
@@ -3756,31 +3875,52 @@ def cmd_api_usage(args: argparse.Namespace) -> None:
         print_api_usage(data, top=args.top)
 
 
-def collect_all(top_n: int) -> dict[str, Any]:
-    return {
+def collect_all(top_n: int, tool: str = "codex") -> dict[str, Any]:
+    data: dict[str, Any] = {
         "retrieved_at_local": local_now_text(),
         "reset_credits": collect_resets(),
         "local_usage": collect_local_usage(CODEX_HOME, top_n=top_n),
         "online_usage": collect_online_usage(),
     }
+    if tool in {"opencode", "all"}:
+        opencode_data = collect_opencode_usage(top_n=top_n)
+        data["opencode_usage"] = opencode_data
+        if tool == "all":
+            data["combined_totals"] = combined_tool_totals(
+                data["local_usage"], opencode_data
+            )
+    return data
 
 
-def print_all(data: dict[str, Any], top: int, days: int, warn_days: int) -> None:
+def print_all(
+    data: dict[str, Any], top: int, days: int, warn_days: int, tool: str = "codex"
+) -> None:
+    rule = "\n" + "=" * min(terminal_width(), 100) + "\n"
     print_resets(data["reset_credits"], warn_days=warn_days)
-    print("\n" + "=" * min(terminal_width(), 100) + "\n")
+    print(rule)
     print_local_usage(data["local_usage"], top=top, days=days)
-    print("\n" + "=" * min(terminal_width(), 100) + "\n")
+    if "opencode_usage" in data:
+        print(rule)
+        print_opencode_usage(data["opencode_usage"], top=top, days=days)
+    print(rule)
     print_online_usage(data["online_usage"], top=top)
+    if tool == "all" and "opencode_usage" in data:
+        print(rule)
+        print_combined_totals(data["local_usage"], data["opencode_usage"])
 
 
 def cmd_all(args: argparse.Namespace) -> None:
     set_colour_mode(getattr(args, "colour", None))
-    data = collect_all(args.top)
+    tool = getattr(args, "tool", "codex")
+    data = collect_all(args.top, tool=tool)
     if args.json:
         limit_local_usage_days(data.get("local_usage"), args.days)
+        limit_local_usage_days(data.get("opencode_usage"), args.days)
         print_json(data)
     else:
-        print_all(data, top=args.top, days=args.days, warn_days=args.warn_days)
+        print_all(
+            data, top=args.top, days=args.days, warn_days=args.warn_days, tool=tool
+        )
 
 
 def render_text(
@@ -4347,6 +4487,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show everything: reset credits, local usage, and online usage/profile.",
     )
     add_common(all_reports)
+    add_tool_option(all_reports)
     all_reports.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )

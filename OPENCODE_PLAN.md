@@ -1,13 +1,13 @@
 # Implementation Plan: opencode usage reporting in `codex_usage.py`
 
-Status: Phases 1 and 2 implemented; Phases 3–6 outstanding
+Status: Phases 1–3 implemented; Phases 4–6 outstanding
 Author: drafted 2026-07-22
 
 | Phase | State |
 |---|---|
 | 1 — read path | Done |
 | 2 — rendering | Done |
-| 3 — combined view (`--tool all` totals table) | Outstanding — `--tool all` currently prints both reports back to back with no combined table |
+| 3 — combined view (`--tool all` totals table) | Done — `--tool` also added to the `all` command |
 | 4 — export | Outstanding — `--tool` is not yet threaded through `export` |
 | 5 — doctor and menu | Outstanding |
 | 6 — docs | Partly done — README covers the fork and opencode support |
@@ -22,6 +22,13 @@ Deviations from the plan as written, discovered during implementation:
 - The §10.6 unreported-usage hint tests input tokens per message (< 10 is not physically
   possible), not the messages/tokens ratio in the original text, and collapses all affected
   models into one line instead of one hint each.
+- `connect_opencode_readonly()` forces a read inside its own error handler. `sqlite3.connect()`
+  is lazy, so the §10.1 `immutable=1` fallback was unreachable until that was fixed: the
+  failure surfaced from the first statement, outside the handler.
+- A `fmt_cost()` helper was added because the existing `fmt_number()` drops the decimals on
+  whole values, rendering a zero cost as `$0`.
+- §7.3's table puts the reason a tool is unavailable in a note under the table rather than in
+  the last column, which otherwise stretches every column to fit a sentence.
 Target file: `codex_usage.py` (single-file, stdlib-only — this constraint is preserved)
 
 ---

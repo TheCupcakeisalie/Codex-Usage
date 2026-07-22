@@ -13,7 +13,7 @@
 >
 > **What the fork deliberately does not add:** anything network-facing for opencode. Reset credits, rate-limit windows and the `api-usage` report are specific to a ChatGPT/OpenAI account and have no opencode equivalent, so opencode support here is local-only by design.
 >
-> The full design, the counting rules and the reasoning behind them are documented in [`OPENCODE_PLAN.md`](OPENCODE_PLAN.md). Work is in progress: the local report is complete in both text and `--json` form. Still to come are the combined totals table for `--tool all`, export support for the opencode CSV sections, and opencode rows in `doctor`.
+> The full design, the counting rules and the reasoning behind them are documented in [`OPENCODE_PLAN.md`](OPENCODE_PLAN.md). Work is in progress: the local report, the combined totals table and `--tool` on `all` are complete in both text and `--json` form. Still to come are export support for the opencode CSV sections and opencode rows in `doctor`.
 >
 > Bug reports about Codex behaviour belong upstream. Please raise opencode-related issues here.
 
@@ -245,7 +245,7 @@ The report shows highlights, session and message counts, token totals, cache eff
 
 **Cost.** The `Cost (reported)` row shows what opencode itself recorded. Subscription-billed providers report zero, so this figure is usually near-zero and is not a bill. The script does not bundle a pricing table and does not estimate cost.
 
-**Not comparable with the Codex figures.** The Codex report takes the final `total_token_usage` counter per session file; the opencode report sums per assistant message. The two use different methods and may bill against different accounts. `--tool all` shows them one after the other to answer "where is my time going", not "what do I owe".
+**Not comparable with the Codex figures.** The Codex report takes the final `total_token_usage` counter per session file; the opencode report sums per assistant message. The two use different methods and may bill against different accounts. `--tool all` ends with a combined totals table that puts the two side by side, with the same caveat printed above it: read it as where your time went, not as what you owe. The gap is large in practice, because the Codex counter is cumulative and includes cached tokens while the opencode figure does not.
 
 **Privacy.** The same guarantee as the rest of the tool applies, with one addition specific to opencode: `session.title` is a model-written summary of the conversation and can leak content, so titles are never read or printed. Sessions are identified by a truncated session id and their working directory.
 
@@ -276,7 +276,8 @@ The report shows highlights, session and message counts, token totals, cache eff
 | `./codex_usage.py resets` | Shows reset-credit count and expiry. | Yes |
 | `./codex_usage.py local-usage` | Shows local Codex metadata and counters only. | No |
 | `./codex_usage.py local-usage --tool opencode` | Shows local opencode metadata and counters only. Fork addition. | No |
-| `./codex_usage.py local-usage --tool all` | Shows both local reports, one after the other. Fork addition. | No |
+| `./codex_usage.py local-usage --tool all` | Shows both local reports plus a combined totals table. Fork addition. | No |
+| `./codex_usage.py all --tool all` | Adds the opencode report and combined totals to the full report. Fork addition. | Yes, for the Codex online parts |
 | `./codex_usage.py doctor` | Checks local setup, report readiness and environment flags without printing secrets. | No |
 | `./codex_usage.py inspect-log FILE.jsonl` | Shows summary metadata from one local session JSONL file without printing prompts, outputs, commands, diffs or raw JSON. | No |
 | `./codex_usage.py online-usage` | Shows read-only online usage/profile data. | Yes |
@@ -294,7 +295,7 @@ Shared display switches:
 | `--top N` | `all`, `menu`, `local-usage`, `online-usage`, `api-usage`, `export` | Limit ranked rows and Technical details field samples. | `10` for `all`, `menu`, `local-usage`, `api-usage` and `export`; `30` for direct `online-usage` |
 | `--days N` | `all`, `menu`, `local-usage`, `api-usage`, `export` | Number of recent days to show/include. For `api-usage`, this controls the Admin API query window. | `30` |
 | `--warn-days N` | `all`, `menu`, `resets`, `export` | Warn when reset credits expire within this many days. Use `0` to disable soon-expiry warnings. | `7` |
-| `--tool {codex,opencode,all}` | `local-usage` | Which coding tool's local data to report on. Fork addition; see [About this fork](#about-this-fork). | `codex` |
+| `--tool {codex,opencode,all}` | `all`, `local-usage` | Which coding tool's local data to report on. Fork addition; see [About this fork](#about-this-fork). | `codex` |
 
 `api-usage` also supports:
 
