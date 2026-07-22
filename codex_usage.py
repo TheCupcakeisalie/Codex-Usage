@@ -3,9 +3,15 @@
 Codex Usage
 ===========
 
-Repository: https://github.com/MacSteini/Codex-Usage
-Author: MacSteini
+Upstream repository: https://github.com/MacSteini/Codex-Usage
+Upstream author: MacSteini
 Licence: MIT
+
+This is a fork. It adds local usage reporting for opencode alongside Codex,
+behind a --tool codex|opencode|all switch on local-usage that defaults to
+codex, so upstream behaviour is unchanged. opencode support is local-only by
+design: the online reports are specific to a ChatGPT/OpenAI account. See
+OPENCODE_PLAN.md for the design and the counting rules.
 
 A single-file command-line tool for Codex users. It shows reset credits,
 rate-limit windows, local usage metadata, read-only online usage/profile data,
@@ -49,8 +55,22 @@ def resolve_codex_home() -> Path:
     return Path.home() / ".codex"
 
 
+def resolve_opencode_data_dir() -> Path:
+    explicit = os.environ.get("OPENCODE_DATA")
+    if explicit:
+        return Path(explicit).expanduser()
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home).expanduser() / "opencode"
+    return Path.home() / ".local" / "share" / "opencode"
+
+
 CODEX_HOME = resolve_codex_home()
 AUTH_PATH = CODEX_HOME / "auth.json"
+OPENCODE_DATA_DIR = resolve_opencode_data_dir()
+OPENCODE_DB = OPENCODE_DATA_DIR / "opencode.db"
+OPENCODE_LEGACY_STORAGE = OPENCODE_DATA_DIR / "storage"
+TOOL_CHOICES = ("codex", "opencode", "all")
 SCRIPT_DIR = Path(__file__).resolve().parent
 EXPORT_DIR = SCRIPT_DIR
 API_BASE = "https://chatgpt.com/backend-api"
@@ -1203,14 +1223,514 @@ def print_local_usage(data: dict[str, Any], top: int, days: int) -> None:
     )
 
 
+# --------------------------------------------------------------------------
+# opencode local usage
+#
+# Reads opencode's SQLite database read-only and returns the same dict shape
+# scan_sessions_metadata() returns, so the shared renderers, day trimming, and
+# CSV export work unchanged. Design notes and the rationale behind the counting
+# rules live in OPENCODE_PLAN.md.
+# --------------------------------------------------------------------------
+
+OPENCODE_MESSAGE_SELECT = """
+CREATE TEMP TABLE oc_msg AS
+SELECT m.session_id AS session_id,
+       m.time_created AS ts_ms,
+       date(m.time_created / 1000, 'unixepoch', 'localtime') AS day,
+       json_extract(m.data, '$.providerID') AS provider,
+       json_extract(m.data, '$.modelID') AS model,
+       json_extract(m.data, '$.agent') AS agent,
+       COALESCE(json_extract(m.data, '$.tokens.input'), 0) AS input_tokens,
+       COALESCE(json_extract(m.data, '$.tokens.output'), 0) AS output_tokens,
+       COALESCE(json_extract(m.data, '$.tokens.reasoning'), 0) AS reasoning_tokens,
+       COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0) AS cache_read,
+       COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0) AS cache_write,
+       COALESCE(json_extract(m.data, '$.cost'), 0.0) AS cost
+FROM message m
+WHERE json_extract(m.data, '$.role') = 'assistant'
+"""
+
+
+def opencode_available() -> bool:
+    return OPENCODE_DB.is_file()
+
+
+def connect_opencode_readonly(path: Path) -> tuple[sqlite3.Connection, bool]:
+    """Open the opencode database read-only.
+
+    Returns the connection and a flag that is True when the WAL had to be
+    ignored, which means very recent sessions may be missing.
+    """
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        # No shared-memory file and nowhere to create one: read the main
+        # database file alone. Uncheckpointed sessions are invisible this way.
+        con = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+        con.execute("PRAGMA busy_timeout = 5000")
+        return con, True
+    con.execute("PRAGMA busy_timeout = 5000")
+    return con, False
+
+
+def opencode_json1_available(con: sqlite3.Connection) -> bool:
+    try:
+        return con.execute("SELECT json_extract('{\"a\":1}', '$.a')").fetchone()[0] == 1
+    except sqlite3.Error:
+        return False
+
+
+def opencode_usage_row(
+    input_tokens: Any,
+    cached_input_tokens: Any,
+    output_tokens: Any,
+    reasoning_tokens: Any,
+) -> dict[str, int]:
+    """Map opencode counters onto USAGE_FIELDS.
+
+    total_tokens is input + output by design. opencode's own tokens.total
+    folds in cache reads, so summing it across messages multiplies
+    cache-heavy sessions into a meaningless figure.
+    """
+    values = {
+        "input_tokens": int(input_tokens or 0),
+        "cached_input_tokens": int(cached_input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "reasoning_output_tokens": int(reasoning_tokens or 0),
+    }
+    values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
+    return values
+
+
+def fmt_epoch_ms_range(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return (
+            datetime.fromtimestamp(float(value) / 1000)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M:%S %Z %z")
+        )
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def scan_opencode_messages(con: sqlite3.Connection, top_n: int) -> dict[str, Any]:
+    cur = con.cursor()
+    # opencode may be running and writing. Hold one deferred read transaction
+    # so every query below sees the same snapshot; otherwise the totals and the
+    # cross-check at the end can disagree purely because time passed.
+    con.isolation_level = None
+    with contextlib.suppress(sqlite3.Error):
+        cur.execute("BEGIN")
+    cur.execute(OPENCODE_MESSAGE_SELECT)
+    cur.execute("CREATE INDEX temp.oc_msg_session_idx ON oc_msg(session_id)")
+
+    row = cur.execute(
+        """
+        SELECT COUNT(*), COUNT(DISTINCT session_id), SUM(input_tokens),
+               SUM(output_tokens), SUM(reasoning_tokens), SUM(cache_read),
+               SUM(cache_write), SUM(cost), MIN(ts_ms), MAX(ts_ms)
+        FROM oc_msg
+        """
+    ).fetchone()
+    (
+        message_count,
+        session_count,
+        input_sum,
+        output_sum,
+        reasoning_sum,
+        cache_read_sum,
+        cache_write_sum,
+        cost_sum,
+        ts_min,
+        ts_max,
+    ) = row
+
+    totals = opencode_usage_row(input_sum, cache_read_sum, output_sum, reasoning_sum)
+
+    sessions_with_tokens = int(
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT session_id FROM oc_msg
+                GROUP BY session_id
+                HAVING SUM(input_tokens + output_tokens) > 0
+            )
+            """
+        ).fetchone()[0]
+        or 0
+    )
+    subagent_sessions = int(
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM session s
+            WHERE s.parent_id IS NOT NULL
+              AND EXISTS (SELECT 1 FROM oc_msg m WHERE m.session_id = s.id)
+            """
+        ).fetchone()[0]
+        or 0
+    )
+
+    daily_usage: list[dict[str, Any]] = []
+    for day, day_sessions, d_in, d_cache, d_out, d_reason, d_cost in cur.execute(
+        """
+        SELECT day, COUNT(DISTINCT session_id), SUM(input_tokens), SUM(cache_read),
+               SUM(output_tokens), SUM(reasoning_tokens), SUM(cost)
+        FROM oc_msg
+        GROUP BY day
+        ORDER BY day
+        """
+    ):
+        entry: dict[str, Any] = {
+            "date": day or "unknown",
+            "sessions": int(day_sessions or 0),
+        }
+        entry.update(opencode_usage_row(d_in, d_cache, d_out, d_reason))
+        entry["cost"] = float(d_cost or 0.0)
+        daily_usage.append(entry)
+
+    models_by_session: list[list[Any]] = []
+    model_token_totals: dict[str, dict[str, int]] = {}
+    for model, m_sessions, m_msgs, m_in, m_cache, m_out, m_reason in cur.execute(
+        """
+        SELECT COALESCE(model, '(unknown)'), COUNT(DISTINCT session_id), COUNT(*),
+               SUM(input_tokens), SUM(cache_read), SUM(output_tokens),
+               SUM(reasoning_tokens)
+        FROM oc_msg
+        GROUP BY COALESCE(model, '(unknown)')
+        ORDER BY SUM(input_tokens + output_tokens) DESC
+        """
+    ):
+        models_by_session.append([model, int(m_sessions or 0)])
+        usage = opencode_usage_row(m_in, m_cache, m_out, m_reason)
+        usage["messages"] = int(m_msgs or 0)
+        model_token_totals[model] = usage
+
+    providers_by_session = [
+        [provider or "(unknown)", int(count or 0)]
+        for provider, count in cur.execute(
+            """
+            SELECT COALESCE(provider, '(unknown)'), COUNT(DISTINCT session_id)
+            FROM oc_msg
+            GROUP BY COALESCE(provider, '(unknown)')
+            ORDER BY SUM(input_tokens + output_tokens) DESC
+            LIMIT 20
+            """
+        )
+    ]
+
+    by_agent: list[dict[str, Any]] = []
+    for agent, a_sessions, a_msgs, a_in, a_cache, a_out, a_reason in cur.execute(
+        """
+        SELECT COALESCE(agent, '(unknown)'), COUNT(DISTINCT session_id), COUNT(*),
+               SUM(input_tokens), SUM(cache_read), SUM(output_tokens),
+               SUM(reasoning_tokens)
+        FROM oc_msg
+        GROUP BY COALESCE(agent, '(unknown)')
+        ORDER BY SUM(input_tokens + output_tokens) DESC
+        LIMIT ?
+        """,
+        (top_n,),
+    ):
+        by_agent.append(
+            {
+                "agent": agent,
+                "sessions": int(a_sessions or 0),
+                "messages": int(a_msgs or 0),
+                "usage": opencode_usage_row(a_in, a_cache, a_out, a_reason),
+            }
+        )
+
+    by_project: list[dict[str, Any]] = []
+    for directory, p_sessions, p_in, p_cache, p_out, p_reason in cur.execute(
+        """
+        SELECT COALESCE(s.directory, '(unknown)'), COUNT(DISTINCT m.session_id),
+               SUM(m.input_tokens), SUM(m.cache_read), SUM(m.output_tokens),
+               SUM(m.reasoning_tokens)
+        FROM oc_msg m
+        LEFT JOIN session s ON s.id = m.session_id
+        GROUP BY COALESCE(s.directory, '(unknown)')
+        ORDER BY SUM(m.input_tokens + m.output_tokens) DESC
+        LIMIT ?
+        """,
+        (top_n,),
+    ):
+        by_project.append(
+            {
+                "project": short_path(directory),
+                "sessions": int(p_sessions or 0),
+                "usage": opencode_usage_row(p_in, p_cache, p_out, p_reason),
+            }
+        )
+
+    top_sessions: list[dict[str, Any]] = []
+    for (
+        session_id,
+        day,
+        model,
+        agent,
+        is_subagent,
+        directory,
+        s_in,
+        s_cache,
+        s_out,
+        s_reason,
+    ) in cur.execute(
+        """
+        SELECT m.session_id,
+               MIN(m.day),
+               (SELECT x.model FROM oc_msg x
+                 WHERE x.session_id = m.session_id
+                 ORDER BY x.ts_ms DESC LIMIT 1),
+               (SELECT x.agent FROM oc_msg x
+                 WHERE x.session_id = m.session_id
+                 ORDER BY x.ts_ms DESC LIMIT 1),
+               MAX(CASE WHEN s.parent_id IS NOT NULL THEN 1 ELSE 0 END),
+               MAX(COALESCE(s.directory, '')),
+               SUM(m.input_tokens), SUM(m.cache_read), SUM(m.output_tokens),
+               SUM(m.reasoning_tokens)
+        FROM oc_msg m
+        LEFT JOIN session s ON s.id = m.session_id
+        GROUP BY m.session_id
+        ORDER BY SUM(m.input_tokens + m.output_tokens) DESC
+        LIMIT ?
+        """,
+        (top_n,),
+    ):
+        top_sessions.append(
+            {
+                # Session titles are model-written summaries of the
+                # conversation and can leak content, so sessions are
+                # identified by id and directory only.
+                "session_file": shorten_identifier(str(session_id), visible=8),
+                "date": day or "unknown",
+                "model": model or "—",
+                "agent": agent or "—",
+                "subagent": bool(is_subagent),
+                "project": short_path(directory or None),
+                "usage": opencode_usage_row(s_in, s_cache, s_out, s_reason),
+            }
+        )
+
+    # Cross-check: the session table keeps its own counters. They should equal
+    # the message-level sums. A real mismatch means the opencode schema
+    # changed, so a tolerance keeps rounding or a stray row from crying wolf.
+    counter_mismatch: dict[str, Any] | None = None
+    try:
+        session_input, session_output = cur.execute(
+            "SELECT SUM(tokens_input), SUM(tokens_output) FROM session"
+        ).fetchone()
+        session_input = int(session_input or 0)
+        session_output = int(session_output or 0)
+        drift = abs(session_input - totals["input_tokens"]) + abs(
+            session_output - totals["output_tokens"]
+        )
+        scale = max(1, totals["input_tokens"] + totals["output_tokens"])
+        if drift / scale > 0.001:
+            counter_mismatch = {
+                "session_table_input_tokens": session_input,
+                "session_table_output_tokens": session_output,
+                "message_level_input_tokens": totals["input_tokens"],
+                "message_level_output_tokens": totals["output_tokens"],
+            }
+    except sqlite3.Error:
+        counter_mismatch = None
+
+    cur.execute("DROP TABLE IF EXISTS temp.oc_msg")
+    with contextlib.suppress(sqlite3.Error):
+        cur.execute("ROLLBACK")
+
+    return {
+        "session_files": int(session_count or 0),
+        "jsonl_lines_scanned": int(message_count or 0),
+        "parse_or_read_errors": 0,
+        "files_with_final_token_totals": sessions_with_tokens,
+        "file_mtime_start_local": fmt_epoch_ms_range(ts_min),
+        "file_mtime_end_local": fmt_epoch_ms_range(ts_max),
+        "final_token_totals_sum": totals,
+        "models_by_session": models_by_session,
+        "model_token_totals": model_token_totals,
+        "providers_by_session": providers_by_session,
+        "context_windows_by_session": [],
+        "daily_usage": daily_usage,
+        "top_sessions_by_total_tokens": top_sessions,
+        "cache_read_tokens": int(cache_read_sum or 0),
+        "cache_write_tokens": int(cache_write_sum or 0),
+        "cost_total": float(cost_sum or 0.0),
+        "subagent_session_count": subagent_sessions,
+        "by_agent": by_agent,
+        "by_project": by_project,
+        "session_counter_mismatch": counter_mismatch,
+    }
+
+
+def collect_opencode_usage(top_n: int) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "retrieved_at_local": local_now_text(),
+        "tool": "opencode",
+        "opencode_data_dir": str(OPENCODE_DATA_DIR),
+        "database": str(OPENCODE_DB),
+        "network_calls_made": 0,
+        "privacy_note": "Local metadata only; message text and session titles are not read or printed.",
+        "stale_read": False,
+        # opencode has no analogue of the Codex thread database. The key is
+        # kept so the shared renderers and exporters need no null guards.
+        "sqlite_threads": {"selected": None, "all": []},
+        "sessions": None,
+    }
+    if not opencode_available():
+        base["error"] = f"No opencode database found at {OPENCODE_DB}"
+        return base
+
+    con = None
+    try:
+        con, stale = connect_opencode_readonly(OPENCODE_DB)
+        base["stale_read"] = stale
+        if not opencode_json1_available(con):
+            base["error"] = (
+                "This Python's SQLite lacks the json1 extension, which is required "
+                "to read opencode token counters."
+            )
+            return base
+        tables = {
+            name
+            for (name,) in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        missing = {"session", "message"} - tables
+        if missing:
+            base["error"] = (
+                f"Unsupported opencode schema: missing table(s) {', '.join(sorted(missing))}"
+            )
+            return base
+        base["sessions"] = scan_opencode_messages(con, top_n=top_n)
+    except sqlite3.Error as exc:
+        base["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if con is not None:
+            with contextlib.suppress(sqlite3.Error):
+                con.close()
+    return base
+
+
+def print_opencode_usage(data: dict[str, Any], top: int, days: int) -> None:
+    section("opencode Local Usage Summary")
+    explain(
+        "This section reads the opencode database already stored on this machine. It counts tokens per assistant message, which is a different method from the Codex section above; treat the two as separate views rather than directly comparable figures."
+    )
+    if data.get("error"):
+        print(colour(str(data["error"]), "yellow"))
+        print()
+        return
+
+    sessions = data.get("sessions") or {}
+    overview_rows = [
+        ["Retrieved", data.get("retrieved_at_local")],
+        ["Database", short_path(data.get("database"), max_chars=60)],
+        ["Network calls made", data.get("network_calls_made")],
+        ["Privacy", "metadata only; no message text or session titles printed"],
+    ]
+    if data.get("stale_read"):
+        overview_rows.append(
+            ["Read mode", "immutable (write-ahead log ignored; may be stale)"]
+        )
+    print_counter_table("Local report overview", ["Metric", "Value"], overview_rows)
+
+    meta_rows = [
+        ["Sessions", fmt_int(sessions.get("session_files"))],
+        ["Subagent sessions", fmt_int(sessions.get("subagent_session_count"))],
+        ["Assistant messages", fmt_int(sessions.get("jsonl_lines_scanned"))],
+        [
+            "Sessions with token totals",
+            fmt_int(sessions.get("files_with_final_token_totals")),
+        ],
+        [
+            "Activity range",
+            f"{sessions.get('file_mtime_start_local') or '—'} → {sessions.get('file_mtime_end_local') or '—'}",
+        ],
+    ]
+    print_counter_table("Session metadata details", ["Metric", "Value"], meta_rows)
+
+    totals = sessions.get("final_token_totals_sum", {})
+    token_rows = [
+        [field.replace("_", " ").title(), fmt_int(totals.get(field))]
+        for field in USAGE_FIELDS
+    ]
+    token_rows.append(
+        ["Cache Write Tokens", fmt_int(sessions.get("cache_write_tokens"))]
+    )
+    token_rows.append(
+        ["Cost (reported)", f"${fmt_number(sessions.get('cost_total'), decimals=2)}"]
+    )
+    explain(
+        "Totals are summed per assistant message. Total Tokens is input plus output only: opencode's own total field folds in cache reads, so adding it up would multiply cache-heavy sessions into a meaningless number. Reported cost is zero for subscription-billed providers, so this is not a bill."
+    )
+    print_counter_table(
+        "Approximate token totals, from per-message counters",
+        ["Field", "Total"],
+        token_rows,
+    )
+
+    mismatch = sessions.get("session_counter_mismatch")
+    if mismatch:
+        print(
+            colour(
+                "Note: opencode's session-table counters disagree with the per-message sums. "
+                "This usually means the opencode schema changed; treat these totals with caution.",
+                "yellow",
+            )
+        )
+        print()
+
+    print("Notes")
+    print("-----")
+    print("• This mode is local-only and made no network calls.")
+    print(
+        "• Subagent sessions are counted in the totals; opencode does not roll them up into their parent."
+    )
+    print(
+        "• Per-model, per-agent, per-project, daily, and top-session tables are collected and available via --json."
+    )
+
+
 def cmd_local_usage(args: argparse.Namespace) -> None:
     set_colour_mode(getattr(args, "colour", None))
-    data = collect_local_usage(CODEX_HOME, top_n=args.top)
+    tool = getattr(args, "tool", "codex")
+    if tool == "codex":
+        data = collect_local_usage(CODEX_HOME, top_n=args.top)
+        if args.json:
+            limit_local_usage_days(data, args.days)
+            print_json(data)
+        else:
+            print_local_usage(data, top=args.top, days=args.days)
+        return
+    if tool == "opencode":
+        data = collect_opencode_usage(top_n=args.top)
+        if args.json:
+            limit_local_usage_days(data, args.days)
+            print_json(data)
+        else:
+            print_opencode_usage(data, top=args.top, days=args.days)
+        return
+
+    codex_data = collect_local_usage(CODEX_HOME, top_n=args.top)
+    opencode_data = collect_opencode_usage(top_n=args.top)
     if args.json:
-        limit_local_usage_days(data, args.days)
-        print_json(data)
-    else:
-        print_local_usage(data, top=args.top, days=args.days)
+        limit_local_usage_days(codex_data, args.days)
+        limit_local_usage_days(opencode_data, args.days)
+        print_json(
+            {
+                "retrieved_at_local": local_now_text(),
+                "codex_local_usage": codex_data,
+                "opencode_local_usage": opencode_data,
+            }
+        )
+        return
+    print_local_usage(codex_data, top=args.top, days=args.days)
+    print("\n" + "=" * min(terminal_width(), 100) + "\n")
+    print_opencode_usage(opencode_data, top=args.top, days=args.days)
 
 
 def path_status(path: Path) -> dict[str, Any]:
@@ -3456,6 +3976,15 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_tool_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--tool",
+        choices=list(TOOL_CHOICES),
+        default="codex",
+        help="Which coding tool's local data to report on: codex, opencode, all. Default: codex.",
+    )
+
+
 def add_api_usage_options(
     parser: argparse.ArgumentParser, include_json: bool, include_top_days: bool
 ) -> None:
@@ -3511,6 +4040,8 @@ def build_parser() -> argparse.ArgumentParser:
               ./codex_usage.py
               ./codex_usage.py resets --warn-days 14
               ./codex_usage.py local-usage --top 20 --days 60
+              ./codex_usage.py local-usage --tool opencode
+              ./codex_usage.py local-usage --tool all --days 14
               ./codex_usage.py online-usage --top 5 --no-colour
               ./codex_usage.py api-usage --group-by model --group-by project_id
               ./codex_usage.py doctor
@@ -3589,9 +4120,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     local_usage = subparsers.add_parser(
         "local-usage",
-        help="Show local-only Codex usage metadata. Makes no network calls.",
+        help="Show local-only Codex or opencode usage metadata. Makes no network calls.",
     )
     add_common(local_usage)
+    add_tool_option(local_usage)
     local_usage.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )

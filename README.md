@@ -1,5 +1,22 @@
 # Codex Usage
 
+> ## About this fork
+>
+> This is a fork of [MacSteini/Codex-Usage](https://github.com/MacSteini/Codex-Usage). All credit for the original tool goes to its author; the upstream project is unmodified in every respect this fork does not explicitly change.
+>
+> **Why this fork exists:** the upstream tool reports on Codex only. This fork adds local usage reporting for [opencode](https://opencode.ai) as well, so a single command can show where token usage is going across both coding tools on one machine.
+>
+> **What the fork adds:**
+>
+> - A `--tool {codex,opencode,all}` switch on `local-usage`. It defaults to `codex`, so every existing command line, JSON key and export filename behaves exactly as upstream does.
+> - An opencode collector that reads `opencode.db` read-only and reports sessions, models, providers, agents, projects, daily totals and top sessions.
+>
+> **What the fork deliberately does not add:** anything network-facing for opencode. Reset credits, rate-limit windows and the `api-usage` report are specific to a ChatGPT/OpenAI account and have no opencode equivalent, so opencode support here is local-only by design.
+>
+> The full design, the counting rules and the reasoning behind them are documented in [`OPENCODE_PLAN.md`](OPENCODE_PLAN.md). Work is in progress: Phase 1 (the read path, `--json` output and a summary report) is complete; the per-model, per-agent, per-project and daily tables are collected and available via `--json` but are not yet rendered as tables in text mode.
+>
+> Bug reports about Codex behaviour belong upstream. Please raise opencode-related issues here.
+
 Codex Usage is a local command-line tool for people who want a clear view of their Codex reset credits, rate-limit windows, local usage metadata, local setup health, one-file session metadata, read-only online usage/profile data and optional OpenAI API organisation usage.
 
 The project is intentionally small: one Python file, no package install and no third-party Python dependencies. The core Codex reports do not need an OpenAI API key. The optional `api-usage` report uses `OPENAI_ADMIN_KEY` when you choose that report.
@@ -18,13 +35,17 @@ This is not an official OpenAI or Codex tool. It does not redeem credits, buy cr
 
 No third-party Python packages are required. By default, Codex Usage reads Codex data from `Path.home() / ".codex"`. Set `CODEX_HOME` to use a different Codex home directory.
 
+For the fork's opencode reports, opencode data is read from `$OPENCODE_DATA`, then `$XDG_DATA_HOME/opencode`, then `~/.local/share/opencode`. Nothing else is required: if opencode is not installed, `--tool opencode` prints a short note and the default `--tool codex` behaviour is untouched.
+
 The source layout is deliberately small:
 
 ```text
 .gitattributes
+.gitignore
 codex_usage.py
 img/
 LICENCE
+OPENCODE_PLAN.md
 README.md
 ```
 
@@ -203,6 +224,31 @@ For automation, print machine-readable JSON instead of prose and tables:
 ./codex_usage.py api-usage --json
 ```
 
+## opencode Support
+
+This section describes the fork addition. Run it with:
+
+```sh
+./codex_usage.py local-usage --tool opencode
+./codex_usage.py local-usage --tool opencode --json
+./codex_usage.py local-usage --tool all
+```
+
+**Where the data comes from.** opencode keeps its history in a SQLite database at `~/.local/share/opencode/opencode.db`. The script opens it read-only, never writes to it, and works while opencode is running. All aggregation happens in SQL inside a single read transaction, so the figures are a consistent snapshot rather than a moving target.
+
+**How tokens are counted.** Totals are summed per assistant message. Two rules are worth knowing because they change the numbers:
+
+- **`Total Tokens` is input plus output only.** opencode's own `tokens.total` field includes cache reads, so summing it across messages inflates cache-heavy sessions into a meaningless figure. Cache reads, cache writes and reasoning tokens are each reported in their own row instead.
+- **Subagent sessions are included.** opencode does not roll a child session's counters into its parent, so excluding them would undercount. They are counted in the totals and flagged individually in the top-sessions list.
+
+**Cost.** The `Cost (reported)` row shows what opencode itself recorded. Subscription-billed providers report zero, so this figure is usually near-zero and is not a bill. The script does not bundle a pricing table and does not estimate cost.
+
+**Not comparable with the Codex figures.** The Codex report takes the final `total_token_usage` counter per session file; the opencode report sums per assistant message. The two use different methods and may bill against different accounts. `--tool all` shows them one after the other to answer "where is my time going", not "what do I owe".
+
+**Privacy.** The same guarantee as the rest of the tool applies, with one addition specific to opencode: `session.title` is a model-written summary of the conversation and can leak content, so titles are never read or printed. Sessions are identified by a truncated session id and their working directory.
+
+**Health check.** If the numbers look wrong, the report cross-checks its per-message sums against opencode's own session-table counters and prints a warning when they disagree, which is the signal that opencode changed its schema.
+
 ## Screenshots
 
 <!-- markdownlint-disable MD033 -- HTML is used here so GitHub can render bounded thumbnails that link to the full-size screenshots. -->
@@ -225,6 +271,8 @@ For automation, print machine-readable JSON instead of prose and tables:
 | `./codex_usage.py all` | Shows reset credits, local usage and online usage/profile. | Yes |
 | `./codex_usage.py resets` | Shows reset-credit count and expiry. | Yes |
 | `./codex_usage.py local-usage` | Shows local Codex metadata and counters only. | No |
+| `./codex_usage.py local-usage --tool opencode` | Shows local opencode metadata and counters only. Fork addition. | No |
+| `./codex_usage.py local-usage --tool all` | Shows both local reports, one after the other. Fork addition. | No |
 | `./codex_usage.py doctor` | Checks local setup, report readiness and environment flags without printing secrets. | No |
 | `./codex_usage.py inspect-log FILE.jsonl` | Shows summary metadata from one local session JSONL file without printing prompts, outputs, commands, diffs or raw JSON. | No |
 | `./codex_usage.py online-usage` | Shows read-only online usage/profile data. | Yes |
@@ -242,6 +290,7 @@ Shared display switches:
 | `--top N` | `all`, `menu`, `local-usage`, `online-usage`, `api-usage`, `export` | Limit ranked rows and Technical details field samples. | `10` for `all`, `menu`, `local-usage`, `api-usage` and `export`; `30` for direct `online-usage` |
 | `--days N` | `all`, `menu`, `local-usage`, `api-usage`, `export` | Number of recent days to show/include. For `api-usage`, this controls the Admin API query window. | `30` |
 | `--warn-days N` | `all`, `menu`, `resets`, `export` | Warn when reset credits expire within this many days. Use `0` to disable soon-expiry warnings. | `7` |
+| `--tool {codex,opencode,all}` | `local-usage` | Which coding tool's local data to report on. Fork addition; see [About this fork](#about-this-fork). | `codex` |
 
 `api-usage` also supports:
 
