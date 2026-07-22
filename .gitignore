@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Reports written next to the script by `export`
+codex_*_report_*.txt
+codex_*_report_*.json
+codex_*_report_*.csv
+opencode_*_report_*.txt
+opencode_*_report_*.json
+opencode_*_report_*.csv
+combined_*_report_*.txt
+combined_*_report_*.json
+combined_*_report_*.csv
