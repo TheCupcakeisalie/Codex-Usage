@@ -8,12 +8,13 @@
 >
 > **What the fork adds:**
 >
-> - A `--tool {codex,opencode,all}` switch on `local-usage`. It defaults to `codex`, so every existing command line, JSON key and export filename behaves exactly as upstream does.
+> - A `--tool {codex,opencode,all}` switch on `local-usage`, `all`, `export` and `menu`. It defaults to `codex`, so every existing command line, JSON key and export filename behaves exactly as upstream does.
 > - An opencode collector that reads `opencode.db` read-only and reports sessions, models, providers, agents, projects, daily totals and top sessions.
+> - A combined totals table when `--tool all` is used, opencode checks in `doctor`, and a daily opencode line in the menu's quick summary.
 >
 > **What the fork deliberately does not add:** anything network-facing for opencode. Reset credits, rate-limit windows and the `api-usage` report are specific to a ChatGPT/OpenAI account and have no opencode equivalent, so opencode support here is local-only by design.
 >
-> The full design, the counting rules and the reasoning behind them are documented in [`OPENCODE_PLAN.md`](OPENCODE_PLAN.md). Work is in progress: the local report, the combined totals table and `--tool` on `all` are complete in both text and `--json` form. Still to come are export support for the opencode CSV sections and opencode rows in `doctor`.
+> The full design, the counting rules and the reasoning behind them are documented in [`OPENCODE_PLAN.md`](OPENCODE_PLAN.md). The fork is feature complete: local reports, the combined totals table, `--tool` on `all` and `export`, opencode checks in `doctor`, and a tool setting plus a daily opencode line in the interactive menu.
 >
 > Bug reports about Codex behaviour belong upstream. Please raise opencode-related issues here.
 
@@ -117,7 +118,7 @@ The menu starts with a quick summary, then offers the report choices and setting
 4) Show online usage/profile (GET only)
 5) Show OpenAI API usage/costs (Admin key)
 6) Export report
-7) Settings (top=10, days=30, warn_days=7)
+7) Settings (top=10, days=30, warn_days=7, tool=codex)
 8) Refresh quick summary
 q) Quit
 ```
@@ -150,6 +151,8 @@ Show local usage without network calls:
 ```sh
 ./codex_usage.py local-usage
 ./codex_usage.py local-usage --top 20 --days 60
+./codex_usage.py local-usage --tool opencode
+./codex_usage.py local-usage --tool all
 ```
 
 Check local setup without network calls:
@@ -295,7 +298,7 @@ Shared display switches:
 | `--top N` | `all`, `menu`, `local-usage`, `online-usage`, `api-usage`, `export` | Limit ranked rows and Technical details field samples. | `10` for `all`, `menu`, `local-usage`, `api-usage` and `export`; `30` for direct `online-usage` |
 | `--days N` | `all`, `menu`, `local-usage`, `api-usage`, `export` | Number of recent days to show/include. For `api-usage`, this controls the Admin API query window. | `30` |
 | `--warn-days N` | `all`, `menu`, `resets`, `export` | Warn when reset credits expire within this many days. Use `0` to disable soon-expiry warnings. | `7` |
-| `--tool {codex,opencode,all}` | `all`, `local-usage`, `export` | Which coding tool's local data to report on. Fork addition; see [About this fork](#about-this-fork). | `codex` |
+| `--tool {codex,opencode,all}` | `all`, `menu`, `local-usage`, `export` | Which coding tool's local data to report on. Fork addition; see [About this fork](#about-this-fork). | `codex` |
 
 `api-usage` also supports:
 
@@ -377,6 +380,8 @@ Online responses are redacted before display or export. Token-like and identity-
 Local usage mode reads metadata and counters from your Codex home directory. It avoids prompt text, assistant text, command text, diffs, transcripts and secret contents.
 
 `doctor` checks local setup metadata only: Python version, script path, Codex home presence, auth file shape, session-file count, SQLite thread table presence and whether `OPENAI_ADMIN_KEY` is set. It does not print token values, account IDs or the Admin key.
+
+In this fork `doctor` also checks the opencode database when one is present: its path and size, write-ahead log size, whether the `session` and `message` tables exist and how many rows they hold, whether SQLite has the `json1` extension the token counters need, and whether the legacy `storage/` directory is still around. That block and its warnings appear only when opencode is installed, so a Codex-only setup sees no new output apart from one `OPENCODE_DATA` environment row.
 
 `inspect-log` reads one `.jsonl` file and prints summary metadata only: counts, timestamps, safe record categories and token counters. It does not print prompts, assistant replies, command text, diffs, raw JSON records, tokens, account IDs or secret values.
 

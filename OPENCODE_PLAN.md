@@ -1,6 +1,6 @@
 # Implementation Plan: opencode usage reporting in `codex_usage.py`
 
-Status: Phases 1–4 implemented; Phases 5–6 outstanding
+Status: Implemented. All six phases complete.
 Author: drafted 2026-07-22
 Target file: `codex_usage.py` (single-file, stdlib-only — this constraint is preserved)
 
@@ -10,8 +10,8 @@ Target file: `codex_usage.py` (single-file, stdlib-only — this constraint is p
 | 2 — rendering | Done |
 | 3 — combined view (`--tool all` totals table) | Done — `--tool` also added to the `all` command |
 | 4 — export | Done — all 3 tools x 3 formats x 2 local reports verified |
-| 5 — doctor and menu | Outstanding |
-| 6 — docs | Partly done — README covers the fork and opencode support |
+| 5 — doctor and menu | Done |
+| 6 — docs | Done — README covers the fork, opencode support, exports, doctor and menu |
 
 Deviations from the plan as written, discovered during implementation:
 
@@ -36,6 +36,12 @@ Deviations from the plan as written, discovered during implementation:
   provider rollup exists and is cheap to emit.
 - `export_prefix()` keeps the `codex_` prefix for reports with no local data (`resets`,
   `online-usage`, `api-usage`) whatever `--tool` says, so those filenames never change.
+- `doctor` gained a `fmt_bytes()` helper: raw byte counts for a 7 GB database are unreadable.
+- The §9.1 opencode block and its warnings render only when opencode is installed. A
+  Codex-only setup sees exactly one new line anywhere in the tool, the `OPENCODE_DATA`
+  environment row.
+- The menu carries `tool` as session state, shows it in the settings line, and asks for it when
+  exporting a report that has local data.
 
 ---
 

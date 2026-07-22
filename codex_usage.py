@@ -190,6 +190,20 @@ def numeric_sort_value(value: Any) -> float:
     return 0.0
 
 
+def fmt_bytes(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(size) < 1024 or unit == "GB":
+            return f"{size:,.0f} {unit}" if unit == "B" else f"{size:,.1f} {unit}"
+        size /= 1024
+    return f"{size:,.1f} GB"
+
+
 def fmt_cost(value: Any) -> str:
     """Money always keeps two decimals, unlike fmt_number()."""
     if value is None:
@@ -2232,6 +2246,81 @@ def count_jsonl_files(path: Path) -> int | None:
         return None
 
 
+def opencode_health() -> dict[str, Any]:
+    """Local setup check for the opencode database. Makes no network calls."""
+    status: dict[str, Any] = {
+        "installed": opencode_available(),
+        "data_dir": path_status(OPENCODE_DATA_DIR),
+        "database": path_status(OPENCODE_DB),
+        "wal": path_status(Path(f"{OPENCODE_DB}-wal")),
+        "shm": path_status(Path(f"{OPENCODE_DB}-shm")),
+        "json1_available": None,
+        "has_session_table": False,
+        "has_message_table": False,
+        "session_rows": None,
+        "message_rows": None,
+        "stale_read": False,
+        "legacy_storage_present": OPENCODE_LEGACY_STORAGE.is_dir(),
+        "warnings": [],
+    }
+    warnings: list[str] = status["warnings"]
+
+    if status["legacy_storage_present"]:
+        status["legacy_storage"] = path_status(OPENCODE_LEGACY_STORAGE)
+
+    wal_size = status["wal"].get("size_bytes")
+    if isinstance(wal_size, int) and wal_size > 100 * 1024 * 1024:
+        warnings.append(
+            f"The opencode write-ahead log is {fmt_int(wal_size // (1024 * 1024))} MB. "
+            "That is not an error, but reads will be slower until opencode checkpoints it."
+        )
+
+    if not status["installed"]:
+        return status
+
+    con = None
+    try:
+        con, stale = connect_opencode_readonly(OPENCODE_DB)
+        status["stale_read"] = stale
+        if stale:
+            warnings.append(
+                "The write-ahead log could not be read, so recent opencode sessions may be missing."
+            )
+        status["json1_available"] = opencode_json1_available(con)
+        if not status["json1_available"]:
+            warnings.append(
+                "This Python's SQLite lacks the json1 extension, so opencode token counters cannot be read."
+            )
+        tables = {
+            name
+            for (name,) in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        status["has_session_table"] = "session" in tables
+        status["has_message_table"] = "message" in tables
+        if status["has_session_table"]:
+            status["session_rows"] = int(
+                con.execute("SELECT COUNT(*) FROM session").fetchone()[0] or 0
+            )
+        if status["has_message_table"]:
+            status["message_rows"] = int(
+                con.execute("SELECT COUNT(*) FROM message").fetchone()[0] or 0
+            )
+        if not (status["has_session_table"] and status["has_message_table"]):
+            warnings.append(
+                "The opencode database does not have the expected session and message tables."
+            )
+    except sqlite3.Error as exc:
+        status["error"] = f"{type(exc).__name__}: {exc}"
+        warnings.append(f"The opencode database could not be read: {status['error']}")
+    finally:
+        if con is not None:
+            with contextlib.suppress(sqlite3.Error):
+                con.close()
+    return status
+
+
 def collect_doctor() -> dict[str, Any]:
     sessions_dir = CODEX_HOME / "sessions"
     auth = auth_health(AUTH_PATH)
@@ -2257,6 +2346,11 @@ def collect_doctor() -> dict[str, Any]:
         warnings.append("No session JSONL files were found under the Codex home.")
     if not any(item.get("has_threads_table") for item in sqlite):
         warnings.append("No readable Codex SQLite threads table was found.")
+    opencode = opencode_health()
+    # Only surface opencode problems when opencode is actually installed:
+    # Codex-only users should see no new warnings.
+    if opencode.get("installed"):
+        warnings.extend(opencode.get("warnings", []))
 
     return {
         "retrieved_at_local": local_now_text(),
@@ -2275,6 +2369,7 @@ def collect_doctor() -> dict[str, Any]:
         },
         "environment": {
             "CODEX_HOME_set": bool(os.environ.get("CODEX_HOME")),
+            "OPENCODE_DATA_set": bool(os.environ.get("OPENCODE_DATA")),
             "OPENAI_ADMIN_KEY_set": admin_key_present,
             "NO_COLOR_set": os.environ.get("NO_COLOR") is not None,
         },
@@ -2286,10 +2381,17 @@ def collect_doctor() -> dict[str, Any]:
             "jsonl_files": session_count,
         },
         "sqlite": sqlite,
+        "opencode": opencode,
         "readiness": {
             "local_usage": local_ready,
             "resets_and_online_usage": auth_ready,
             "api_usage": admin_key_present,
+            "opencode_local_usage": bool(
+                opencode.get("installed")
+                and opencode.get("has_session_table")
+                and opencode.get("has_message_table")
+                and opencode.get("json1_available")
+            ),
         },
         "warnings": warnings,
     }
@@ -2322,6 +2424,10 @@ def print_doctor(data: dict[str, Any]) -> None:
         ["Setting", "Status"],
         [
             ["CODEX_HOME", "set" if env.get("CODEX_HOME_set") else "default"],
+            [
+                "OPENCODE_DATA",
+                "set" if env.get("OPENCODE_DATA_set") else "default",
+            ],
             [
                 ADMIN_KEY_ENV,
                 "set (value hidden)" if env.get("OPENAI_ADMIN_KEY_set") else "not set",
@@ -2366,19 +2472,67 @@ def print_doctor(data: dict[str, Any]) -> None:
         sqlite_rows,
     )
 
-    readiness = data.get("readiness", {})
-    print_counter_table(
-        "Readiness",
-        ["Report", "Ready"],
-        [
-            ["local-usage", bool_text(readiness.get("local_usage"))],
+    opencode = data.get("opencode", {})
+    if opencode.get("installed"):
+        explain(
+            "opencode support is a fork addition. This checks the local opencode database the same way, read-only."
+        )
+        opencode_rows = [
+            ["Data directory", opencode.get("data_dir", {}).get("path")],
+            ["Database", opencode.get("database", {}).get("path")],
             [
-                "resets / online-usage",
-                bool_text(readiness.get("resets_and_online_usage")),
+                "Database size",
+                fmt_bytes(opencode.get("database", {}).get("size_bytes")),
             ],
-            ["api-usage", bool_text(readiness.get("api_usage"))],
+            [
+                "Write-ahead log size",
+                fmt_bytes(opencode.get("wal", {}).get("size_bytes")),
+            ],
+            [
+                "Read mode",
+                "immutable (may be stale)"
+                if opencode.get("stale_read")
+                else "read-only",
+            ],
+            [
+                "json1 extension",
+                bool_text(opencode.get("json1_available"))
+                if opencode.get("json1_available") is not None
+                else "unknown, the database could not be opened",
+            ],
+            ["Session table", bool_text(opencode.get("has_session_table"))],
+            ["Sessions", fmt_int(opencode.get("session_rows"))],
+            ["Message table", bool_text(opencode.get("has_message_table"))],
+            ["Messages", fmt_int(opencode.get("message_rows"))],
+        ]
+        if opencode.get("error"):
+            opencode_rows.append(["Error", opencode["error"]])
+        if opencode.get("legacy_storage_present"):
+            opencode_rows.append(
+                [
+                    "Legacy storage directory",
+                    "present; not read, the database supersedes it",
+                ]
+            )
+        print_counter_table("opencode local state", ["Item", "Value"], opencode_rows)
+
+    readiness = data.get("readiness", {})
+    readiness_rows = [
+        ["local-usage", bool_text(readiness.get("local_usage"))],
+        [
+            "resets / online-usage",
+            bool_text(readiness.get("resets_and_online_usage")),
         ],
-    )
+        ["api-usage", bool_text(readiness.get("api_usage"))],
+    ]
+    if opencode.get("installed"):
+        readiness_rows.append(
+            [
+                "local-usage --tool opencode",
+                bool_text(readiness.get("opencode_local_usage")),
+            ]
+        )
+    print_counter_table("Readiness", ["Report", "Ready"], readiness_rows)
     warnings = data.get("warnings", [])
     if warnings:
         print(colour("Warnings", "yellow"))
@@ -3312,11 +3466,45 @@ def print_online_technical_details(data: dict[str, Any], top: int) -> None:
         print()
 
 
+def opencode_quick_totals() -> dict[str, Any] | None:
+    """Today's opencode totals for the menu box.
+
+    Two aggregates rather than the full scan, and any failure returns None
+    so a missing or locked database never blocks the menu.
+    """
+    if not opencode_available():
+        return None
+    con = None
+    try:
+        con, _ = connect_opencode_readonly(OPENCODE_DB)
+        if not opencode_json1_available(con):
+            return None
+        row = con.execute(
+            """
+            SELECT COUNT(DISTINCT session_id),
+                   SUM(COALESCE(json_extract(data, '$.tokens.input'), 0)
+                       + COALESCE(json_extract(data, '$.tokens.output'), 0))
+            FROM message
+            WHERE json_extract(data, '$.role') = 'assistant'
+              AND date(time_created / 1000, 'unixepoch', 'localtime')
+                  = date('now', 'localtime')
+            """
+        ).fetchone()
+        return {"sessions": int(row[0] or 0), "total_tokens": int(row[1] or 0)}
+    except sqlite3.Error:
+        return None
+    finally:
+        if con is not None:
+            with contextlib.suppress(sqlite3.Error):
+                con.close()
+
+
 def collect_quick_summary() -> dict[str, Any]:
     return {
         "retrieved_at_local": local_now_text(),
         "reset_credits": collect_resets(),
         "online_usage": collect_online_usage(),
+        "opencode_today": opencode_quick_totals(),
     }
 
 
@@ -3381,6 +3569,14 @@ def quick_summary_lines(summary: dict[str, Any]) -> list[str]:
     )
     if lifetime is not None:
         lines.append(f"Lifetime tokens: {fmt_int(lifetime)}")
+    opencode_today = (
+        summary.get("opencode_today") if isinstance(summary, dict) else None
+    )
+    if isinstance(opencode_today, dict):
+        lines.append(
+            f"opencode today: {fmt_int(opencode_today.get('sessions'))} session(s), "
+            f"{fmt_int(opencode_today.get('total_tokens'))} tokens"
+        )
     return lines or ["Quick summary unavailable; choose a report for details."]
 
 
@@ -4314,7 +4510,9 @@ def after_report(action: Callable[[], None]) -> str:
         print("Please choose r, m, or q.")
 
 
-def menu_show_settings_help(top: int, days: int, warn_days: int) -> None:
+def menu_show_settings_help(
+    top: int, days: int, warn_days: int, tool: str = "codex"
+) -> None:
     menu_clear()
     section("Display Settings")
     print("These settings only affect how much information the menu shows during this")
@@ -4346,6 +4544,13 @@ def menu_show_settings_help(top: int, days: int, warn_days: int) -> None:
         "  soon-expiry warnings. Expired credits still show their status if returned."
     )
     print()
+    print_kv("Current tool", tool)
+    print("  tool chooses whose local data the local reports read: codex, opencode,")
+    print("  or all for both plus a combined totals table. It affects local reports")
+    print("  and exports only; the online reports are Codex-specific either way.")
+    if not opencode_available():
+        print("  opencode was not found on this machine, so only codex will have data.")
+    print()
     print("Press Enter at a prompt to keep the current value.")
 
 
@@ -4354,6 +4559,7 @@ def cmd_menu(args: argparse.Namespace) -> None:
     top = args.top
     days = args.days
     warn_days = args.warn_days
+    tool = getattr(args, "tool", "codex")
     quick_summary: dict[str, Any] | None = None
     quick_summary_error: str | None = None
     while True:
@@ -4372,7 +4578,7 @@ def cmd_menu(args: argparse.Namespace) -> None:
             "4) Show online usage/profile (GET only)",
             "5) Show OpenAI API usage/costs (Admin key)",
             "6) Export report",
-            f"7) Settings (top={top}, days={days}, warn_days={warn_days})",
+            f"7) Settings (top={top}, days={days}, warn_days={warn_days}, tool={tool})",
             "8) Refresh quick summary",
             "q) Quit",
         ]
@@ -4394,7 +4600,12 @@ def cmd_menu(args: argparse.Namespace) -> None:
             def action() -> None:
                 cmd_all(
                     argparse.Namespace(
-                        json=False, top=top, days=days, warn_days=warn_days, colour=None
+                        json=False,
+                        top=top,
+                        days=days,
+                        warn_days=warn_days,
+                        colour=None,
+                        tool=tool,
                     )
                 )
 
@@ -4417,7 +4628,9 @@ def cmd_menu(args: argparse.Namespace) -> None:
 
             def action() -> None:
                 cmd_local_usage(
-                    argparse.Namespace(json=False, top=top, days=days, colour=None)
+                    argparse.Namespace(
+                        json=False, top=top, days=days, colour=None, tool=tool
+                    )
                 )
 
             menu_clear()
@@ -4461,6 +4674,18 @@ def cmd_menu(args: argparse.Namespace) -> None:
                 or "all"
             )
             fmt = menu_read_choice("Format [txt/json/csv] (default txt): ") or "txt"
+            export_tool = tool
+            if report in {"all", "local-usage"}:
+                chosen = (
+                    menu_read_choice(f"Tool [codex/opencode/all] (default {tool}): ")
+                    .strip()
+                    .lower()
+                )
+                if chosen:
+                    if chosen in TOOL_CHOICES:
+                        export_tool = chosen
+                    else:
+                        print(f"Unknown tool: {chosen}. Using {tool}.")
             if report not in {
                 "all",
                 "resets",
@@ -4472,19 +4697,22 @@ def cmd_menu(args: argparse.Namespace) -> None:
                 quick_summary = None
                 quick_summary_error = None
                 continue
-            path = export_report(report, fmt, top, days, warn_days)
+            path = export_report(report, fmt, top, days, warn_days, tool=export_tool)
             print(f"Exported to: {path}")
             quick_summary = None
             quick_summary_error = None
             continue
         elif choice in {"7", "s", "settings"}:
-            menu_show_settings_help(top, days, warn_days)
+            menu_show_settings_help(top, days, warn_days, tool)
             new_top = menu_read_choice("\nNew top row limit (blank keeps current): ")
             new_days = menu_read_choice(
                 "New daily-history day count (blank keeps current): "
             )
             new_warn = menu_read_choice(
                 "New reset-expiry warning window in days (0 disables; blank keeps current): "
+            )
+            new_tool = menu_read_choice(
+                "New tool [codex/opencode/all] (blank keeps current): "
             )
             try:
                 if new_top:
@@ -4493,19 +4721,31 @@ def cmd_menu(args: argparse.Namespace) -> None:
                     days = max(1, int(new_days))
                 if new_warn:
                     warn_days = max(0, int(new_warn))
+                if new_tool:
+                    if new_tool.strip().lower() in TOOL_CHOICES:
+                        tool = new_tool.strip().lower()
+                    else:
+                        print(
+                            f"Unknown tool: {new_tool}. Keeping {tool}. Choose codex, opencode or all."
+                        )
                 print()
                 print("Updated display settings for this menu session:")
                 print_kv("top rows", top)
                 print_kv("daily-history days", days)
                 print_kv("reset warning days", warn_days)
+                print_kv("tool", tool)
                 if (
-                    after_report(lambda: menu_show_settings_help(top, days, warn_days))
+                    after_report(
+                        lambda: menu_show_settings_help(top, days, warn_days, tool)
+                    )
                     == "quit"
                 ):
                     return
             except ValueError:
                 print("Please enter whole numbers, e.g. 10, 30, or 7.")
-                after_report(lambda: menu_show_settings_help(top, days, warn_days))
+                after_report(
+                    lambda: menu_show_settings_help(top, days, warn_days, tool)
+                )
         elif choice in {"8", "refresh-summary", "summary"}:
             quick_summary = None
             quick_summary_error = None
@@ -4664,6 +4904,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     menu = subparsers.add_parser("menu", help="Open the interactive TUI-style menu.")
     add_common(menu)
+    add_tool_option(menu)
     menu.add_argument(
         "--top",
         type=positive_int,
