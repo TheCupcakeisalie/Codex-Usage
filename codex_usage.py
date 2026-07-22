@@ -1407,18 +1407,23 @@ def scan_opencode_messages(con: sqlite3.Connection, top_n: int) -> dict[str, Any
         usage["messages"] = int(m_msgs or 0)
         model_token_totals[model] = usage
 
-    providers_by_session = [
-        [provider or "(unknown)", int(count or 0)]
-        for provider, count in cur.execute(
-            """
-            SELECT COALESCE(provider, '(unknown)'), COUNT(DISTINCT session_id)
-            FROM oc_msg
-            GROUP BY COALESCE(provider, '(unknown)')
-            ORDER BY SUM(input_tokens + output_tokens) DESC
-            LIMIT 20
-            """
-        )
-    ]
+    providers_by_session: list[list[Any]] = []
+    provider_token_totals: dict[str, dict[str, int]] = {}
+    for provider, p_sessions, p_msgs, p_in, p_cache, p_out, p_reason in cur.execute(
+        """
+        SELECT COALESCE(provider, '(unknown)'), COUNT(DISTINCT session_id), COUNT(*),
+               SUM(input_tokens), SUM(cache_read), SUM(output_tokens),
+               SUM(reasoning_tokens)
+        FROM oc_msg
+        GROUP BY COALESCE(provider, '(unknown)')
+        ORDER BY SUM(input_tokens + output_tokens) DESC
+        LIMIT 20
+        """
+    ):
+        providers_by_session.append([provider, int(p_sessions or 0)])
+        usage = opencode_usage_row(p_in, p_cache, p_out, p_reason)
+        usage["messages"] = int(p_msgs or 0)
+        provider_token_totals[provider] = usage
 
     by_agent: list[dict[str, Any]] = []
     for agent, a_sessions, a_msgs, a_in, a_cache, a_out, a_reason in cur.execute(
@@ -1433,12 +1438,14 @@ def scan_opencode_messages(con: sqlite3.Connection, top_n: int) -> dict[str, Any
         """,
         (top_n,),
     ):
+        agent_usage = opencode_usage_row(a_in, a_cache, a_out, a_reason)
+        agent_usage["messages"] = int(a_msgs or 0)
         by_agent.append(
             {
                 "agent": agent,
                 "sessions": int(a_sessions or 0),
                 "messages": int(a_msgs or 0),
-                "usage": opencode_usage_row(a_in, a_cache, a_out, a_reason),
+                "usage": agent_usage,
             }
         )
 
@@ -1552,6 +1559,7 @@ def scan_opencode_messages(con: sqlite3.Connection, top_n: int) -> dict[str, Any
         "models_by_session": models_by_session,
         "model_token_totals": model_token_totals,
         "providers_by_session": providers_by_session,
+        "provider_token_totals": provider_token_totals,
         "context_windows_by_session": [],
         "daily_usage": daily_usage,
         "top_sessions_by_total_tokens": top_sessions,
@@ -1615,6 +1623,113 @@ def collect_opencode_usage(top_n: int) -> dict[str, Any]:
     return base
 
 
+def opencode_cache_read_ratio(sessions: dict[str, Any]) -> float | None:
+    """Share of read context that came from cache, as a percentage.
+
+    Deliberately not presented as a cost saving: the script has no pricing
+    table and cannot convert cache hits into money.
+    """
+    totals = sessions.get("final_token_totals_sum", {})
+    cache_read = int(sessions.get("cache_read_tokens") or 0)
+    input_tokens = int(totals.get("input_tokens") or 0)
+    denominator = cache_read + input_tokens
+    if denominator <= 0:
+        return None
+    return cache_read / denominator * 100
+
+
+def opencode_hints(data: dict[str, Any]) -> list[str]:
+    hints: list[str] = []
+    sessions = data.get("sessions")
+    if not isinstance(sessions, dict):
+        return hints
+    totals = sessions.get("final_token_totals_sum", {})
+    total_tokens = int(totals.get("total_tokens") or 0)
+
+    ratio = opencode_cache_read_ratio(sessions)
+    if ratio is not None and ratio >= 50:
+        hints.append(
+            f"Cache reads are {ratio:.1f}% of all context read, which is typical of long agent sessions."
+        )
+
+    model_totals = sessions.get("model_token_totals", {})
+    if isinstance(model_totals, dict) and model_totals and total_tokens:
+        top_model, top_usage = max(
+            model_totals.items(),
+            key=lambda item: int(item[1].get("total_tokens") or 0),
+        )
+        share = int(top_usage.get("total_tokens") or 0) / max(1, total_tokens) * 100
+        if share >= 50:
+            hints.append(
+                f"Model {top_model} accounts for {share:.1f}% of opencode tokens."
+            )
+
+    daily = sessions.get("daily_usage", [])
+    if isinstance(daily, list) and daily:
+        busiest = max(daily, key=lambda row: int(row.get("total_tokens") or 0))
+        hints.append(
+            f"Busiest day: {busiest.get('date')} with {fmt_int(busiest.get('total_tokens'))} tokens across {fmt_int(busiest.get('sessions'))} session(s)."
+        )
+
+    subagents = int(sessions.get("subagent_session_count") or 0)
+    session_count = int(sessions.get("session_files") or 0)
+    if subagents and session_count:
+        hints.append(
+            f"{fmt_int(subagents)} of {fmt_int(session_count)} sessions are subagent sessions, counted in these totals."
+        )
+
+    cost = float(sessions.get("cost_total") or 0.0)
+    if cost > 0:
+        hints.append(
+            f"Reported cost is ${fmt_number(cost, decimals=2)}; subscription-billed providers report zero, so real spend may be higher."
+        )
+
+    # Some providers return no usage data at all. Fewer than ten input tokens
+    # per message is not physically possible for a real request, so treat that
+    # as unreported rather than as real usage, and say so: otherwise the near
+    # zero rows read as a bug in this script.
+    if isinstance(model_totals, dict):
+        unreported: list[tuple[str, int]] = []
+        for model, usage in model_totals.items():
+            messages = int(usage.get("messages") or 0)
+            if messages >= 50 and int(usage.get("input_tokens") or 0) < messages * 10:
+                unreported.append((str(model), messages))
+        if unreported:
+            unreported.sort(key=lambda item: item[1], reverse=True)
+            affected = fmt_int(sum(count for _, count in unreported))
+            names = ", ".join(name for name, _ in unreported[:3])
+            if len(unreported) > 3:
+                names += f" and {len(unreported) - 3} more"
+            hints.append(
+                f"No usable token counts for {affected} messages on {names}: those providers reported little or no usage, so their totals understate real use."
+            )
+
+    if data.get("stale_read"):
+        hints.append(
+            "The write-ahead log could not be read, so very recent sessions may be missing."
+        )
+    return hints
+
+
+def opencode_usage_table_rows(
+    entries: list[tuple[str, dict[str, Any], int]], total_tokens: int, top: int
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for label, usage, sessions_count in entries[:top]:
+        model_total = int(usage.get("total_tokens") or 0)
+        rows.append(
+            [
+                label,
+                fmt_int(sessions_count),
+                fmt_int(usage.get("messages")),
+                fmt_int(model_total),
+                fmt_int(usage.get("output_tokens")),
+                fmt_percent(model_total / max(1, total_tokens) * 100),
+            ]
+        )
+    return rows
+
+
 def print_opencode_usage(data: dict[str, Any], top: int, days: int) -> None:
     section("opencode Local Usage Summary")
     explain(
@@ -1637,6 +1752,13 @@ def print_opencode_usage(data: dict[str, Any], top: int, days: int) -> None:
             ["Read mode", "immutable (write-ahead log ignored; may be stale)"]
         )
     print_counter_table("Local report overview", ["Metric", "Value"], overview_rows)
+
+    hints = opencode_hints(data)
+    if hints:
+        print(colour("Highlights", "cyan"))
+        for item in hints:
+            print(f"  • {item}")
+        print()
 
     meta_rows = [
         ["Sessions", fmt_int(sessions.get("session_files"))],
@@ -1673,6 +1795,21 @@ def print_opencode_usage(data: dict[str, Any], top: int, days: int) -> None:
         token_rows,
     )
 
+    ratio = opencode_cache_read_ratio(sessions)
+    if ratio is not None:
+        explain(
+            "Cache read ratio is the share of all context read that came from the provider's cache. It is an efficiency indicator, not a cost saving: this script has no pricing table."
+        )
+        print_counter_table(
+            "Cache efficiency",
+            ["Metric", "Value"],
+            [
+                ["Cache read ratio", fmt_percent(ratio)],
+                ["Cache read tokens", fmt_int(sessions.get("cache_read_tokens"))],
+                ["Cache write tokens", fmt_int(sessions.get("cache_write_tokens"))],
+            ],
+        )
+
     mismatch = sessions.get("session_counter_mismatch")
     if mismatch:
         print(
@@ -1684,6 +1821,136 @@ def print_opencode_usage(data: dict[str, Any], top: int, days: int) -> None:
         )
         print()
 
+    daily = sessions.get("daily_usage", [])
+    recent_daily = daily[-days:] if days > 0 else daily
+    daily_rows = [
+        [
+            str(row.get("date")),
+            fmt_int(row.get("sessions")),
+            fmt_int(row.get("total_tokens")),
+            fmt_int(row.get("output_tokens")),
+            fmt_int(row.get("cached_input_tokens")),
+        ]
+        for row in recent_daily
+    ]
+    explain(
+        "Daily totals show when local opencode activity happened, grouped by the local date of each assistant message."
+    )
+    print_counter_table(
+        f"Daily local token totals, last {len(recent_daily)} days",
+        ["Date", "Sessions", "Total tokens", "Output tokens", "Cache read"],
+        daily_rows,
+    )
+
+    total_tokens = int(totals.get("total_tokens") or 0)
+
+    model_totals = sessions.get("model_token_totals", {})
+    model_sessions = dict(
+        (str(name), int(count or 0))
+        for name, count in sessions.get("models_by_session", [])
+    )
+    model_entries = sorted(
+        (
+            (str(model), usage, model_sessions.get(str(model), 0))
+            for model, usage in model_totals.items()
+        ),
+        key=lambda item: int(item[1].get("total_tokens") or 0),
+        reverse=True,
+    )
+    explain(
+        "Model attribution comes from each assistant message rather than the session row, because opencode leaves the session-level model field empty on older sessions."
+    )
+    print_counter_table(
+        "Tokens by model",
+        ["Model", "Sessions", "Messages", "Total tokens", "Output", "Share"],
+        opencode_usage_table_rows(model_entries, total_tokens, top),
+    )
+
+    provider_totals = sessions.get("provider_token_totals", {})
+    provider_sessions = dict(
+        (str(name), int(count or 0))
+        for name, count in sessions.get("providers_by_session", [])
+    )
+    provider_entries = sorted(
+        (
+            (str(provider), usage, provider_sessions.get(str(provider), 0))
+            for provider, usage in provider_totals.items()
+        ),
+        key=lambda item: int(item[1].get("total_tokens") or 0),
+        reverse=True,
+    )
+    explain(
+        "The same figures grouped by provider, which is the useful view when one model name is served by more than one provider."
+    )
+    print_counter_table(
+        "Tokens by provider",
+        ["Provider", "Sessions", "Messages", "Total tokens", "Output", "Share"],
+        opencode_usage_table_rows(provider_entries, total_tokens, top),
+    )
+
+    agent_entries = [
+        (
+            str(item.get("agent", "—")),
+            item.get("usage", {}),
+            int(item.get("sessions") or 0),
+        )
+        for item in sessions.get("by_agent", [])
+    ]
+    explain(
+        "opencode routes work through named agents such as build, plan and explore. This shows which of them consume the tokens. One session can use several agents, so the session counts here overlap and sum to more than the session total."
+    )
+    print_counter_table(
+        "Tokens by agent",
+        ["Agent", "Sessions", "Messages", "Total tokens", "Output", "Share"],
+        opencode_usage_table_rows(agent_entries, total_tokens, top),
+    )
+
+    project_rows = []
+    for item in sessions.get("by_project", [])[:top]:
+        usage = item.get("usage", {})
+        project_total = int(usage.get("total_tokens") or 0)
+        project_rows.append(
+            [
+                str(item.get("project", "—")),
+                fmt_int(item.get("sessions")),
+                fmt_int(project_total),
+                fmt_int(usage.get("output_tokens")),
+                fmt_percent(project_total / max(1, total_tokens) * 100),
+            ]
+        )
+    explain(
+        "Projects are the working directories opencode recorded for each session. Use this to see which codebase dominates local usage."
+    )
+    print_counter_table(
+        "Tokens by project",
+        ["Project", "Sessions", "Total tokens", "Output", "Share"],
+        project_rows,
+    )
+
+    top_rows = []
+    for item in sessions.get("top_sessions_by_total_tokens", [])[:top]:
+        usage = item.get("usage", {})
+        marker = "↳ " if item.get("subagent") else ""
+        top_rows.append(
+            [
+                str(item.get("date", "—")),
+                str(item.get("model", "—")),
+                str(item.get("agent", "—")),
+                fmt_int(usage.get("total_tokens")),
+                fmt_int(usage.get("output_tokens")),
+                str(item.get("project", "—")),
+                marker + str(item.get("session_file", "—")),
+            ]
+        )
+    explain(
+        "The largest local sessions by total tokens. Sessions marked ↳ are subagent sessions. Sessions are identified by a truncated id because opencode session titles are model-written summaries that can reveal conversation content."
+    )
+    print_counter_table(
+        "Top sessions by total tokens",
+        ["Date", "Model", "Agent", "Total", "Output", "Project", "Session"],
+        top_rows,
+    )
+
     print("Notes")
     print("-----")
     print("• This mode is local-only and made no network calls.")
@@ -1691,7 +1958,10 @@ def print_opencode_usage(data: dict[str, Any], top: int, days: int) -> None:
         "• Subagent sessions are counted in the totals; opencode does not roll them up into their parent."
     )
     print(
-        "• Per-model, per-agent, per-project, daily, and top-session tables are collected and available via --json."
+        "• Total tokens is input plus output. Cache reads and reasoning tokens are reported separately."
+    )
+    print(
+        "• Reported cost is what opencode recorded. Subscription-billed providers report zero, so this is not a bill."
     )
 
 

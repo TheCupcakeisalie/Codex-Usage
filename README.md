@@ -13,7 +13,7 @@
 >
 > **What the fork deliberately does not add:** anything network-facing for opencode. Reset credits, rate-limit windows and the `api-usage` report are specific to a ChatGPT/OpenAI account and have no opencode equivalent, so opencode support here is local-only by design.
 >
-> The full design, the counting rules and the reasoning behind them are documented in [`OPENCODE_PLAN.md`](OPENCODE_PLAN.md). Work is in progress: Phase 1 (the read path, `--json` output and a summary report) is complete; the per-model, per-agent, per-project and daily tables are collected and available via `--json` but are not yet rendered as tables in text mode.
+> The full design, the counting rules and the reasoning behind them are documented in [`OPENCODE_PLAN.md`](OPENCODE_PLAN.md). Work is in progress: the local report is complete in both text and `--json` form. Still to come are the combined totals table for `--tool all`, export support for the opencode CSV sections, and opencode rows in `doctor`.
 >
 > Bug reports about Codex behaviour belong upstream. Please raise opencode-related issues here.
 
@@ -234,6 +234,8 @@ This section describes the fork addition. Run it with:
 ./codex_usage.py local-usage --tool all
 ```
 
+The report shows highlights, session and message counts, token totals, cache efficiency, daily totals, and tokens broken down by model, provider, agent and project, plus the largest sessions.
+
 **Where the data comes from.** opencode keeps its history in a SQLite database at `~/.local/share/opencode/opencode.db`. The script opens it read-only, never writes to it, and works while opencode is running. All aggregation happens in SQL inside a single read transaction, so the figures are a consistent snapshot rather than a moving target.
 
 **How tokens are counted.** Totals are summed per assistant message. Two rules are worth knowing because they change the numbers:
@@ -246,6 +248,8 @@ This section describes the fork addition. Run it with:
 **Not comparable with the Codex figures.** The Codex report takes the final `total_token_usage` counter per session file; the opencode report sums per assistant message. The two use different methods and may bill against different accounts. `--tool all` shows them one after the other to answer "where is my time going", not "what do I owe".
 
 **Privacy.** The same guarantee as the rest of the tool applies, with one addition specific to opencode: `session.title` is a model-written summary of the conversation and can leak content, so titles are never read or printed. Sessions are identified by a truncated session id and their working directory.
+
+**Unreported usage.** Some providers return no token counts at all. Rather than presenting those near-zero rows as real, the report flags them in the Highlights block, naming the models affected and the message count involved.
 
 **Health check.** If the numbers look wrong, the report cross-checks its per-message sums against opencode's own session-table counters and prints a warning when they disagree, which is the signal that opencode changed its schema.
 

@@ -1,7 +1,27 @@
 # Implementation Plan: opencode usage reporting in `codex_usage.py`
 
-Status: proposed, not yet implemented
+Status: Phases 1 and 2 implemented; Phases 3–6 outstanding
 Author: drafted 2026-07-22
+
+| Phase | State |
+|---|---|
+| 1 — read path | Done |
+| 2 — rendering | Done |
+| 3 — combined view (`--tool all` totals table) | Outstanding — `--tool all` currently prints both reports back to back with no combined table |
+| 4 — export | Outstanding — `--tool` is not yet threaded through `export` |
+| 5 — doctor and menu | Outstanding |
+| 6 — docs | Partly done — README covers the fork and opencode support |
+
+Deviations from the plan as written, discovered during implementation:
+
+- All rollups run against one `TEMP TABLE` built from a single `json_extract` pass, rather than
+  re-scanning per rollup as §4.3 implied. Whole report: ~0.8 s.
+- The entire scan holds one deferred read transaction. Without it, each statement gets its own
+  snapshot and the §12 cross-check fires spuriously when opencode is writing concurrently — it
+  did, on the very first run, by 2,081 tokens. The check also gained a 0.1% tolerance.
+- The §10.6 unreported-usage hint tests input tokens per message (< 10 is not physically
+  possible), not the messages/tokens ratio in the original text, and collapses all affected
+  models into one line instead of one hint each.
 Target file: `codex_usage.py` (single-file, stdlib-only — this constraint is preserved)
 
 ---
