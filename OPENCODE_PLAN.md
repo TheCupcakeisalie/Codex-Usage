@@ -1,14 +1,15 @@
 # Implementation Plan: opencode usage reporting in `codex_usage.py`
 
-Status: Phases 1–3 implemented; Phases 4–6 outstanding
+Status: Phases 1–4 implemented; Phases 5–6 outstanding
 Author: drafted 2026-07-22
+Target file: `codex_usage.py` (single-file, stdlib-only — this constraint is preserved)
 
 | Phase | State |
 |---|---|
 | 1 — read path | Done |
 | 2 — rendering | Done |
 | 3 — combined view (`--tool all` totals table) | Done — `--tool` also added to the `all` command |
-| 4 — export | Outstanding — `--tool` is not yet threaded through `export` |
+| 4 — export | Done — all 3 tools x 3 formats x 2 local reports verified |
 | 5 — doctor and menu | Outstanding |
 | 6 — docs | Partly done — README covers the fork and opencode support |
 
@@ -29,7 +30,12 @@ Deviations from the plan as written, discovered during implementation:
   whole values, rendering a zero cost as `$0`.
 - §7.3's table puts the reason a tool is unavailable in a note under the table rather than in
   the last column, which otherwise stretches every column to fit a sentence.
-Target file: `codex_usage.py` (single-file, stdlib-only — this constraint is preserved)
+- `rows_for_csv()` needed a guard the plan did not anticipate: an unreadable opencode database
+  leaves `sessions` as `None`, and the existing code assumed a dict.
+- CSV gained an `opencode_provider_usage` section beyond the five listed in §8.2, since the
+  provider rollup exists and is cheap to emit.
+- `export_prefix()` keeps the `codex_` prefix for reports with no local data (`resets`,
+  `online-usage`, `api-usage`) whatever `--tool` says, so those filenames never change.
 
 ---
 

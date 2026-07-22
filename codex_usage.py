@@ -3956,13 +3956,27 @@ def export_json(
     limit: int | None = None,
     group_by: list[str] | None = None,
     no_costs: bool = False,
+    tool: str = "codex",
 ) -> Any:
     if report == "resets":
         return collect_resets()
     if report == "local-usage":
-        data = collect_local_usage(CODEX_HOME, top_n=top)
-        limit_local_usage_days(data, days)
-        return data
+        if tool == "opencode":
+            data = collect_opencode_usage(top_n=top)
+            limit_local_usage_days(data, days)
+            return data
+        codex_data = collect_local_usage(CODEX_HOME, top_n=top)
+        limit_local_usage_days(codex_data, days)
+        if tool == "codex":
+            return codex_data
+        opencode_data = collect_opencode_usage(top_n=top)
+        limit_local_usage_days(opencode_data, days)
+        return {
+            "retrieved_at_local": local_now_text(),
+            "codex_local_usage": codex_data,
+            "opencode_local_usage": opencode_data,
+            "combined_totals": combined_tool_totals(codex_data, opencode_data),
+        }
     if report == "online-usage":
         return collect_online_usage()
     if report == "api-usage":
@@ -3975,25 +3989,143 @@ def export_json(
             no_costs=no_costs,
         )
         return collect_api_usage(args)
-    data = collect_all(top)
+    data = collect_all(top, tool=tool)
     limit_local_usage_days(data.get("local_usage"), days)
+    limit_local_usage_days(data.get("opencode_usage"), days)
     return data
 
 
-def rows_for_csv(report: str, data: Any, top: int = 200) -> list[dict[str, Any]]:
+def split_local_payloads(
+    report: str, data: Any, tool: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Find the Codex and opencode local payloads in an exported structure.
+
+    The shape depends on both the report and the tool, so the CSV writer asks
+    here rather than repeating the branching.
+    """
+    if not isinstance(data, dict):
+        return None, None
+    if report == "local-usage":
+        if tool == "codex":
+            return data, None
+        if tool == "opencode":
+            return None, data
+        return data.get("codex_local_usage"), data.get("opencode_local_usage")
+    if report == "all":
+        return data.get("local_usage"), data.get("opencode_usage")
+    return None, None
+
+
+def opencode_csv_rows(
+    opencode_data: dict[str, Any] | None, top: int
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not isinstance(opencode_data, dict):
+        return rows
+    sessions = opencode_data.get("sessions")
+    if not isinstance(sessions, dict):
+        return rows
+
+    for row in sessions.get("daily_usage", []):
+        rows.append({"section": "opencode_daily_usage", **row})
+
+    model_sessions = dict(
+        (str(name), int(count or 0))
+        for name, count in sessions.get("models_by_session", [])
+    )
+    model_totals = sessions.get("model_token_totals", {})
+    if isinstance(model_totals, dict):
+        for model, usage in list(model_totals.items())[:top]:
+            rows.append(
+                {
+                    "section": "opencode_model_usage",
+                    "model": model,
+                    "sessions": model_sessions.get(str(model), 0),
+                    **{
+                        key: value
+                        for key, value in usage.items()
+                        if key != "session_id"
+                    },
+                }
+            )
+
+    provider_sessions = dict(
+        (str(name), int(count or 0))
+        for name, count in sessions.get("providers_by_session", [])
+    )
+    provider_totals = sessions.get("provider_token_totals", {})
+    if isinstance(provider_totals, dict):
+        for provider, usage in list(provider_totals.items())[:top]:
+            rows.append(
+                {
+                    "section": "opencode_provider_usage",
+                    "provider": provider,
+                    "sessions": provider_sessions.get(str(provider), 0),
+                    **usage,
+                }
+            )
+
+    for item in sessions.get("by_agent", [])[:top]:
+        rows.append(
+            {
+                "section": "opencode_agent_usage",
+                "agent": item.get("agent"),
+                "sessions": item.get("sessions"),
+                **item.get("usage", {}),
+            }
+        )
+
+    for item in sessions.get("by_project", [])[:top]:
+        rows.append(
+            {
+                "section": "opencode_project_usage",
+                "project": item.get("project"),
+                "sessions": item.get("sessions"),
+                **item.get("usage", {}),
+            }
+        )
+
+    for item in sessions.get("top_sessions_by_total_tokens", [])[:top]:
+        rows.append(
+            {
+                "section": "opencode_top_session",
+                "session": item.get("session_file"),
+                "date": item.get("date"),
+                "model": item.get("model"),
+                "agent": item.get("agent"),
+                "subagent": item.get("subagent"),
+                "project": item.get("project"),
+                **item.get("usage", {}),
+            }
+        )
+    return rows
+
+
+def rows_for_csv(
+    report: str, data: Any, top: int = 200, tool: str = "codex"
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if report in {"resets", "all"}:
         reset_data = data if report == "resets" else data.get("reset_credits", {})
         for credit in reset_data.get("credits", []):
             rows.append({"section": "reset_credit", **credit})
     if report in {"local-usage", "all"}:
-        local = data if report == "local-usage" else data.get("local_usage", {})
-        sessions = local.get("sessions", {})
+        codex_local, opencode_local = split_local_payloads(report, data, tool)
+        local = codex_local if isinstance(codex_local, dict) else {}
+        # An unreadable opencode database leaves "sessions" as None, so this
+        # cannot assume a dict.
+        sessions = local.get("sessions") or {}
         for row in sessions.get("daily_usage", []):
             rows.append({"section": "daily_local_usage", **row})
-        selected = local.get("sqlite_threads", {}).get("selected") or {}
+        selected = (local.get("sqlite_threads") or {}).get("selected") or {}
         for row in selected.get("by_model", [])[:top]:
             rows.append({"section": "sqlite_model_usage", **row})
+        rows.extend(opencode_csv_rows(opencode_local, top))
+        combined = data.get("combined_totals") if isinstance(data, dict) else None
+        if isinstance(combined, list):
+            for row in combined:
+                if isinstance(row, dict):
+                    rows.append({"section": "combined_tool_totals", **row})
     if report in {"online-usage", "all"}:
         online = data if report == "online-usage" else data.get("online_usage", {})
         for name, item in online.get("endpoints", {}).items():
@@ -4041,12 +4173,24 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def export_path(report: str, fmt: str) -> Path:
+def export_prefix(report: str, tool: str) -> str:
+    """Filename prefix for an export.
+
+    Reports that carry no local data keep the codex_ prefix regardless of
+    --tool, so existing filenames never change meaning.
+    """
+    if report not in {"local-usage", "all"} or tool == "codex":
+        return "codex"
+    return "opencode" if tool == "opencode" else "combined"
+
+
+def export_path(report: str, fmt: str, tool: str = "codex") -> Path:
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H%M%S_%f")
-    path = EXPORT_DIR / f"codex_{report}_report_{timestamp}.{fmt}"
+    prefix = export_prefix(report, tool)
+    path = EXPORT_DIR / f"{prefix}_{report}_report_{timestamp}.{fmt}"
     counter = 1
     while path.exists():
-        path = EXPORT_DIR / f"codex_{report}_report_{timestamp}_{counter}.{fmt}"
+        path = EXPORT_DIR / f"{prefix}_{report}_report_{timestamp}_{counter}.{fmt}"
         counter += 1
     return path
 
@@ -4061,16 +4205,21 @@ def export_report(
     limit: int | None = None,
     group_by: list[str] | None = None,
     no_costs: bool = False,
+    tool: str = "codex",
 ) -> Path:
-    path = export_path(report, fmt)
+    path = export_path(report, fmt, tool)
     if fmt == "json":
-        data = export_json(report, top, days, bucket_width, limit, group_by, no_costs)
+        data = export_json(
+            report, top, days, bucket_width, limit, group_by, no_costs, tool
+        )
         with path.open("x", encoding="utf-8") as handle:
             handle.write(json.dumps(data, indent=2, ensure_ascii=False))
             handle.write("\n")
     elif fmt == "csv":
-        data = export_json(report, top, days, bucket_width, limit, group_by, no_costs)
-        write_csv(path, rows_for_csv(report, data, top=top))
+        data = export_json(
+            report, top, days, bucket_width, limit, group_by, no_costs, tool
+        )
+        write_csv(path, rows_for_csv(report, data, top=top, tool=tool))
     elif fmt == "txt":
         args = argparse.Namespace(
             json=False,
@@ -4082,6 +4231,7 @@ def export_report(
             limit=limit,
             group_by=group_by or [],
             no_costs=no_costs,
+            tool=tool,
         )
         funcs = {
             "all": cmd_all,
@@ -4110,6 +4260,7 @@ def cmd_export(args: argparse.Namespace) -> None:
         args.limit,
         args.group_by,
         args.no_costs,
+        getattr(args, "tool", "codex"),
     )
     print(f"Exported {args.report} report to: {path}")
 
@@ -4633,6 +4784,7 @@ def build_parser() -> argparse.ArgumentParser:
         "export", help="Export a report next to this script as TXT, JSON, or CSV."
     )
     add_common(export)
+    add_tool_option(export)
     export.add_argument(
         "--report",
         choices=["all", "resets", "local-usage", "online-usage", "api-usage"],

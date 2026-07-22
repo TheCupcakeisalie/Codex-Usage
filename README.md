@@ -295,7 +295,7 @@ Shared display switches:
 | `--top N` | `all`, `menu`, `local-usage`, `online-usage`, `api-usage`, `export` | Limit ranked rows and Technical details field samples. | `10` for `all`, `menu`, `local-usage`, `api-usage` and `export`; `30` for direct `online-usage` |
 | `--days N` | `all`, `menu`, `local-usage`, `api-usage`, `export` | Number of recent days to show/include. For `api-usage`, this controls the Admin API query window. | `30` |
 | `--warn-days N` | `all`, `menu`, `resets`, `export` | Warn when reset credits expire within this many days. Use `0` to disable soon-expiry warnings. | `7` |
-| `--tool {codex,opencode,all}` | `all`, `local-usage` | Which coding tool's local data to report on. Fork addition; see [About this fork](#about-this-fork). | `codex` |
+| `--tool {codex,opencode,all}` | `all`, `local-usage`, `export` | Which coding tool's local data to report on. Fork addition; see [About this fork](#about-this-fork). | `codex` |
 
 `api-usage` also supports:
 
@@ -333,6 +333,7 @@ Export-only switches:
 | --- | --- | --- |
 | `--report {all,resets,local-usage,online-usage,api-usage}` | Chooses which report to save. | `all` |
 | `--format {txt,json,csv}` | Chooses the export format. | `txt` |
+| `--tool {codex,opencode,all}` | Which coding tool's local data to include. Applies to `--report local-usage` and `--report all`; other reports have no local data and ignore it. Fork addition. | `codex` |
 
 When `--report api-usage` is selected, the export command also accepts `--bucket-width`, `--limit`, `--group-by` and `--no-costs`.
 
@@ -347,7 +348,17 @@ codex_online-usage_report_2026-06-20_114005.csv
 codex_api-usage_report_2026-06-20_114005.csv
 ```
 
-The script never removes exported reports. If you export inside a Git checkout, check `git status` before committing and keep generated `codex_*_report_*` files out of the source release.
+In this fork the prefix follows `--tool`, so exports for different tools never overwrite or shadow each other. Reports with no local data keep the `codex_` prefix whatever `--tool` says, so existing filenames never change meaning:
+
+```text
+opencode_local-usage_report_2026-06-20_114005.csv
+combined_local-usage_report_2026-06-20_114005.csv
+combined_all_report_2026-06-20_114005.json
+```
+
+CSV exports tag every row with a `section` column. The fork adds `opencode_daily_usage`, `opencode_model_usage`, `opencode_provider_usage`, `opencode_agent_usage`, `opencode_project_usage`, `opencode_top_session` and `combined_tool_totals`. The existing `daily_local_usage` and `sqlite_model_usage` sections keep their exact meaning and stay Codex-only, so anything parsing older exports still works.
+
+The script never removes exported reports. If you export inside a Git checkout, check `git status` before committing and keep generated `codex_*_report_*`, `opencode_*_report_*` and `combined_*_report_*` files out of the source release. This fork's `.gitignore` already covers all three.
 
 ## Privacy And Authentication
 
