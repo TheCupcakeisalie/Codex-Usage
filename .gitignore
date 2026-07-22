@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.ruff_cache/
 
 # Reports written next to the script by `export`
 codex_*_report_*.txt

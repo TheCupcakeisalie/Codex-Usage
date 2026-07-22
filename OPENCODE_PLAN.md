@@ -144,17 +144,30 @@ Also present and *not* used: `auth.json`, `account.json`, `log/`, `snapshot/`, `
 
 `part`, `todo`, `permission`, `event`, `session_share`, … — not needed.
 
-### 3.3 Verified measurements (baseline for tests)
+### 3.3 Verified measurements
+
+**These absolute figures go stale the moment anyone uses opencode again, and they did — the
+drafting run showed 761 sessions and the implementation was finished against 767. Do not treat
+them as fixtures.** What survives is the *invariant* below, which is checked at runtime on
+every scan and is the only assertion worth relying on.
+
+Measured after implementation (opencode 1.18.4, 2026-07-22):
 
 ```
-sessions:                     761  (246 with parent_id NOT NULL)
-sessions with model NULL:     372  (355 of those still have tokens > 0)
-messages:                  48,101  (44,446 assistant rows; 0 with a NULL modelID)
+sessions:                     767  (251 with parent_id NOT NULL)
+sessions with model NULL:     372  (unchanged: only older rows lack it)
+messages:                  48,438  (44,774 assistant rows; 0 with a NULL modelID)
 date range:            2026-02-11 → 2026-07-22
-SUM(session.tokens_input)                        = 243,098,583
-SUM(message json_extract tokens.input)           = 243,098,583   ← identical
-SUM(session.cost)  = SUM(message cost)           = 21.340209824
+SUM(session.tokens_input)                        = 245,331,056
+SUM(message json_extract tokens.input)           = 245,331,056   ← identical
+SUM(session.cost)                                = 21.340209824
 ```
+
+**The invariant:** `SUM(session.tokens_input)` equals the message-level sum exactly. It held at
+761 sessions and it holds at 767. `scan_opencode_messages()` recomputes both on every run and
+warns when they diverge by more than 0.1%, so a future opencode schema change surfaces as a
+visible warning rather than silently wrong totals. Note that both sides must be read inside one
+transaction, or concurrent writes make them disagree — see the deviations list at the top.
 
 **Two consequences that drive the design:**
 
@@ -580,19 +593,35 @@ statement extension, and a note that opencode support is local-only by design.
 No test framework exists in the repo today; keep verification as runnable commands plus a small
 optional self-check.
 
-**Baseline assertions** (values from §3.3, this machine):
+**Baseline assertions.** Absolute counts are useless as fixtures because the database keeps
+growing — see §3.3. The one assertion that matters is the cross-check invariant:
 
 ```
-sessions == 761, messages(assistant) == 44446
-sum(input_tokens) == 243_098_583
-sum(cost) ≈ 21.3402
-message-level sum == SUM(session.tokens_input)     # cross-check invariant
+message-level sum == SUM(session.tokens_input)
 ```
 
-That last one is the important one and should ship as a runtime cross-check: compute both, and
-if they diverge by more than a rounding tolerance, emit a hint that the session counters and
-message counters disagree (indicating an opencode schema change). It is cheap and it turns a
-future silent-wrong-numbers regression into a visible warning.
+It shipped as a runtime check inside `scan_opencode_messages()`: both sides are computed on
+every scan, inside one transaction, and a divergence above 0.1% prints a warning. That turns a
+future opencode schema change from silently wrong totals into a visible message.
+
+**Coverage as implemented.** Every code path in the fork has been executed at least once. There
+is no automated suite — this is a record of what was run by hand, not something that reruns.
+
+| path | how it was reached |
+|---|---|
+| Normal read, all rollups | the real database, repeatedly |
+| Missing database | `OPENCODE_DATA=/nonexistent` |
+| Empty database, valid schema | fixture; confirms no divide-by-zero in share/ratio maths |
+| Wrong schema | fixture with an unrelated table |
+| Corrupt file | 4 KB of `/dev/urandom` named `opencode.db` |
+| Read-only fallback (`immutable=1`, `stale_read`) | fixture: WAL-mode database, no `-shm`, read-only directory |
+| Stale read that still returns data | same fixture, checkpointed first |
+| Missing `json1` | harness that imports the module and stubs `opencode_json1_available` |
+| Concurrent writes during a scan | opencode running live; this is what exposed the transaction bug |
+
+The `json1` and read-only-fallback rows are the two that cannot be reached through the CLI on a
+normal machine, and both were previously shipped untested. The fallback turned out to be dead
+code when it was finally exercised.
 
 **Manual matrix:**
 
