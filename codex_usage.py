@@ -1263,14 +1263,22 @@ def connect_opencode_readonly(path: Path) -> tuple[sqlite3.Connection, bool]:
     """
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.OperationalError:
-        # No shared-memory file and nowhere to create one: read the main
-        # database file alone. Uncheckpointed sessions are invisible this way.
-        con = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
         con.execute("PRAGMA busy_timeout = 5000")
-        return con, True
+        # sqlite3.connect() does not touch the file, so the read has to be
+        # forced here. Without it a database that cannot be opened read-only
+        # fails later, outside this handler, and the fallback never runs.
+        con.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        return con, False
+    except sqlite3.Error:
+        with contextlib.suppress(NameError, sqlite3.Error):
+            con.close()
+    # Read-only open failed, which usually means SQLite could not create the
+    # shared-memory file a write-ahead log needs. Read the main database file
+    # alone: uncheckpointed sessions are invisible that way, hence the flag.
+    con = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
     con.execute("PRAGMA busy_timeout = 5000")
-    return con, False
+    con.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    return con, True
 
 
 def opencode_json1_available(con: sqlite3.Connection) -> bool:
@@ -1609,9 +1617,20 @@ def collect_opencode_usage(top_n: int) -> dict[str, Any]:
         }
         missing = {"session", "message"} - tables
         if missing:
-            base["error"] = (
-                f"Unsupported opencode schema: missing table(s) {', '.join(sorted(missing))}"
-            )
+            if stale:
+                # The write-ahead log had to be skipped, so anything not yet
+                # checkpointed into the main file is invisible. Say that
+                # rather than blaming the schema.
+                base["error"] = (
+                    f"Could not read {OPENCODE_DB} fully: the write-ahead log was "
+                    "unreadable and the main database file does not yet contain "
+                    f"table(s) {', '.join(sorted(missing))}. Close opencode, or make "
+                    "the directory writable, and try again."
+                )
+            else:
+                base["error"] = (
+                    f"Unsupported opencode schema: missing table(s) {', '.join(sorted(missing))}"
+                )
             return base
         base["sessions"] = scan_opencode_messages(con, top_n=top_n)
     except sqlite3.Error as exc:
